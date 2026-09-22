@@ -1,0 +1,42 @@
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Env / secrets
+.env
+*.env.local
+
+# Docker
+volumes/
+*.log
+
+# dbt
+gold_dbt/target/
+gold_dbt/dbt_packages/
+gold_dbt/logs/
+
+# Terraform
+infra/**/.terraform/
+infra/**/*.tfstate
+infra/**/*.tfstate.backup
+infra/**/.terraform.lock.hcl
+
+# Spark / checkpoints
+checkpoints/
+spark-warehouse/
+
+# OS
+.DS_Store
+Thumbs.db
