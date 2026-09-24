@@ -12,12 +12,13 @@ The domain is a quick-commerce delivery marketplace: orders mutate through a rea
 prices change over time. That combination forces every hard streaming problem — out-of-order events,
 SCD Type 2 over CDC, watermarking, exactly-once sinks — to appear naturally rather than as a contrived demo.
 
-Everything runs locally on Docker. A Terraform module deploys the equivalent Azure slice
-(ADLS Gen2 + Event Hubs + Databricks + Unity Catalog) and tears it back down to zero.
+Everything runs locally on Docker. There is no cloud account, subscription, or credential anywhere in
+the project — see [Runs entirely on your machine](#runs-entirely-on-your-machine).
 
-> **Project status: Phase 0 — foundation in progress.** The architecture, data model, and build plan are
-> settled and documented below. Phase-by-phase state is tracked in [Build status](#build-status).
-> Screenshots and the demo GIF land as each phase completes.
+> **Project status: Phase 0 complete.** The core stack comes up healthy, Postgres runs with logical
+> replication, and the architecture, data model and build plan are documented below. Phase 1 (source
+> simulation) is next. Phase-by-phase state is tracked in [Build status](#build-status); screenshots
+> and the demo GIF land as each phase completes.
 
 ---
 
@@ -85,10 +86,10 @@ Everything runs locally on Docker. A Terraform module deploys the equivalent Azu
 |                -> Marquez UI (column-level where supported)            |
 | METRICS        Prometheus <- Spark / Kafka / custom exporters          |
 |                -> Grafana: freshness, consumer lag, DQ %, row deltas   |
-| ALERTING       Alertmanager -> Slack webhook                           |
+| ALERTING       Alertmanager -> local webhook receiver                  |
 | CI/CD          GitHub Actions: ruff + mypy, pytest + chispa,           |
 |                testcontainers integration test, dbt build              |
-| IaC            Terraform - Azure slice                                 |
+| IaC            Terraform - validate-only portability exercise (Phase 7) |
 +------------------------------------------------------------------------+
 ```
 
@@ -111,58 +112,59 @@ Everything runs locally on Docker. A Terraform module deploys the equivalent Azu
 
 ## Run it in 3 commands
 
-Requires Docker 24+, Docker Compose v2, and ~8 GB of RAM allocated to Docker.
+Requires Docker 24+, Docker Compose v2, and ~8 GB of RAM allocated to Docker. No Python needed for
+this part — every service runs in a container.
 
 ```bash
-git clone https://github.com/SonamKumari1227/streamhouse.git && cd streamhouse
+git clone https://github.com/SonamKumari1227/StreamHouse.git && cd StreamHouse
 cp .env.example .env
-make demo          # core stack up, Postgres seeded, contracts + Debezium registered,
-                   # Bronze stream running
+make up && make db-init
 ```
 
-Then mutate a row and watch it arrive:
+Then verify the stack, including the one condition the whole project depends on:
 
 ```bash
-docker compose exec postgres psql -U streamhouse \
-  -c "UPDATE orders SET status='DELIVERED' WHERE order_id=1;"
-make query-bronze  # the CDC event appears within ~10s
+make health        # every service, plus: wal_level must print `logical`
 ```
 
-`make down` stops everything; `make clean` also drops volumes.
+`make down` stops everything and keeps your data; `make clean` also drops the volumes.
+
+> **What works today:** Phase 0 — the core stack comes up healthy and Postgres is ready for CDC.
+> Streaming, Silver, Gold, orchestration and dashboards arrive in Phases 2–6, and each phase adds its
+> own Make targets as it lands. `make help` always lists what actually exists.
 
 <details>
-<summary><b>Step-by-step setup</b> — what <code>make demo</code> does, and how to add the other stacks</summary>
+<summary><b>Step-by-step</b> — what <code>make up</code> does, and running Compose directly</summary>
+
+Every Make target is a thin wrapper, so you can drive Compose yourself:
 
 ```bash
-# Python 3.11 venv — NOT 3.13. PySpark 3.5.x supports 3.8–3.11 only.
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1        # macOS/Linux: source .venv/bin/activate
-pip install -r requirements.txt
-
-cp .env.example .env                # MinIO keys, Postgres password, optional SLACK_WEBHOOK_URL
-
-docker compose --profile core up -d # ~6 GB: postgres, redpanda, connect, minio, spark
-docker compose ps                   # every service should report "healthy"
-
-make db-init                        # Postgres DDL + logical replication
-docker compose exec postgres psql -U streamhouse -c "SHOW wal_level;"   # expect: logical
-
-make minio-init                     # buckets: bronze/ silver/ gold/ quarantine/ checkpoints/
-make contracts-register             # Avro schemas -> schema registry (BACKWARD compat)
-make debezium-register
-curl -s localhost:8083/connectors/streamhouse-pg/status | jq            # expect RUNNING
-
-make generate                       # synthetic OLTP + GPS load; add CHAOS=1 to inject failures
-make stream-bronze                  # Spark Structured Streaming: Kafka -> Bronze Delta
-
-# Layer on the rest as you need them
-docker compose --profile orchestration up -d   # Airflow
-docker compose --profile observability up -d   # Marquez, Prometheus, Grafana
+docker compose -f infra/docker-compose.yml --profile core up -d
+docker compose -f infra/docker-compose.yml ps        # all services should report "healthy"
+docker compose -f infra/docker-compose.yml logs -f postgres
 ```
 
-**Windows note:** keep the repo *and* all Docker volumes inside the WSL2 filesystem. Docker Desktop file
-I/O across the Windows/WSL boundary is roughly an order of magnitude slower, and it will make Spark look
-broken when it isn't.
+The **core** profile is postgres, redpanda, redpanda-console, connect, minio, spark-master and
+spark-worker — roughly 6 GB. The `orchestration` and `observability` profiles are not used until
+Phases 5 and 6.
+
+Kafka Connect and Spark come up **idle**. No connector is registered and no job is submitted until
+Phase 2; they run so the stack is complete and `make health` means something.
+
+The Python virtualenv first matters in Phase 1, when the data generator runs on the host:
+
+```bash
+py -3.11 -m venv .venv              # 3.11 explicitly — PySpark 3.5.x does not support 3.13
+.\.venv\Scripts\Activate.ps1        # macOS/Linux: source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+**Windows note:** keep the repo *and* all Docker volumes inside the WSL2 filesystem. Docker Desktop
+file I/O across the Windows/WSL boundary is roughly an order of magnitude slower, and it will make
+Spark look broken when it isn't.
+
+Full operational detail — per-service verification, common failures, teardown — is in
+[docs/runbook.md](docs/runbook.md).
 
 </details>
 
@@ -280,12 +282,12 @@ Each links to a full ADR — context, options, decision, consequences.
 | Decision | Short rationale | ADR |
 | --- | --- | --- |
 | **Debezium** (log-based CDC) over query-based | Reads the Postgres WAL, so it captures `DELETE`s and never polls the source. `WHERE updated_at > x` silently misses deletes and any intra-interval update. | [ADR-0001](docs/decisions/0001-why-debezium.md) |
-| **Delta Lake** as table format | Maps directly onto Databricks / Unity Catalog. An Iceberg branch exists to compare the two on measured numbers rather than blog claims. | [ADR-0002](docs/decisions/0002-delta-vs-iceberg.md) |
-| **Airflow 3** as orchestrator | Dominates enterprise Azure job postings. Dagster's asset model is conceptually cleaner; a port of one pipeline shows the contrast. | [ADR-0003](docs/decisions/0003-airflow-vs-dagster.md) |
+| **Delta Lake** as table format | Mature `MERGE INTO`, time travel, and `OPTIMIZE`/`ZORDER` â all of which the Silver layer depends on. An Iceberg branch compares the two on measured numbers rather than blog claims. | [ADR-0002](docs/decisions/0002-delta-vs-iceberg.md) |
+| **Airflow 3** as orchestrator | Mature sensors, backfills, SLA handling, and dynamic task mapping. Dagster's asset model is conceptually cleaner; a port of one pipeline shows the contrast. | [ADR-0003](docs/decisions/0003-airflow-vs-dagster.md) |
 | **SCD Type 2** over snapshot-per-day | Preserves exact validity windows for price and status history at a fraction of the storage. | [ADR-0004](docs/decisions/0004-scd2-vs-snapshots.md) |
-| **Redpanda** over Kafka | Kafka API-compatible, single binary, no ZooKeeper/KRaft tuning, ~1 GB RAM vs 4 GB+. Swaps to Azure Event Hubs by config alone. | [ADR-0005](docs/decisions/0005-redpanda-vs-kafka.md) |
+| **Redpanda** over Kafka | Kafka API-compatible, single binary, no ZooKeeper/KRaft tuning, ~1 GB RAM vs 4 GB+. Ships a built-in schema registry, so no separate container. | [ADR-0005](docs/decisions/0005-redpanda-vs-kafka.md) |
 | **Quality enforced twice** — GE at ingestion, dbt at transform | GE catches structural and statistical drift on raw data; dbt tests catch business-rule violations where the business logic already lives. | [ADR-0006](docs/decisions/0006-where-quality-lives.md) |
-| **MinIO** as object store | S3A-compatible, so identical Spark code runs against ADLS Gen2 with only a credential swap. That portability is the point. | — |
+| **MinIO** as object store | Self-hosted and S3A-compatible, so the storage layer is swappable by configuration alone. That portability is the point, and Phase 7 proves it locally. | — |
 | **dbt-spark** for Gold | Version-controlled SQL with tests, docs and lineage included. Hand-written PySpark for Gold gives none of those. | — |
 
 ---
@@ -346,14 +348,14 @@ Built in eight phases, each ending in something demoable and committed.
 
 | Phase | Scope | Status |
 | --- | --- | --- |
-| 0 | Foundation — repo, pre-commit, `core` Compose profile, Postgres DDL + logical replication, ADR-0001 | 🔨 In progress |
-| 1 | Source simulation — OLTP generator, order state machine, GPS producer, `--chaos` | ⬜ Not started |
+| 0 | Foundation — repo skeleton, `core` Compose profile, Postgres DDL + logical replication, ADR-0001, runbook | ✅ Done |
+| 1 | Source simulation — OLTP generator, order state machine, GPS producer, `--chaos` | 🔨 Next |
 | 2 | CDC ingestion + contracts — Debezium, Avro registry, Bronze streaming, DLQ, exactly-once | ⬜ Not started |
 | 3 | Silver — SCD2 `MERGE`, dedup on `(pk, lsn)`, GPS sessionization, GE gate, `OPTIMIZE`/`ZORDER` | ⬜ Not started |
 | 4 | Gold — dbt star schema, `dim_date` from holidays, weather join, generic + singular tests, docs | ⬜ Not started |
 | 5 | Orchestration — Airflow DAGs, dynamic task mapping, idempotent backfills, SLA callbacks | ⬜ Not started |
 | 6 | Observability — OpenLineage → Marquez, Grafana SLO dashboard, alert rules, runbook | ⬜ Not started |
-| 7 | Azure slice — Terraform: ADLS Gen2, Event Hubs, Databricks, Unity Catalog, rehearsed teardown | ⬜ Optional |
+| 7 | Portability & IaC (validate-only, no cloud spend) — Terraform as a documented design exercise, storage-layer swap proven locally, ADR on the mapping | ⬜ Optional |
 | 8 | Stretch — Iceberg comparison, Dagster port, streaming Gold, contract CI gate, cost model | ⬜ Optional |
 
 **Done, for the project as a whole:** a stranger can clone this and reach a working pipeline in under 15
@@ -362,24 +364,19 @@ test; and every component choice has a written ADR behind it.
 
 ---
 
-## Azure path
+## Runs entirely on your machine
 
-The local stack is free and complete. The Terraform slice exists to prove the same design runs in the cloud.
+No cloud account, no subscription, no credentials, no spend. Every component above runs in Docker
+locally, and there is no managed service anywhere in the pipeline.
 
-| Local component | Azure equivalent |
-| --- | --- |
-| MinIO | ADLS Gen2 |
-| Redpanda | Event Hubs (Kafka endpoint — no code change) |
-| Spark on Docker | Azure Databricks |
-| Delta on MinIO | Delta on ADLS Gen2 + Unity Catalog |
-| Airflow | Databricks Workflows, or Azure Managed Airflow |
-| Marquez | Unity Catalog lineage / Microsoft Purview |
-| Grafana | Azure Monitor + Log Analytics |
-| `.env` secrets | Azure Key Vault |
+The only external calls in the whole project are to two free public APIs — [Open-Meteo](https://open-meteo.com)
+for weather and [Nager.Date](https://date.nager.at) for public holidays. Neither needs an account or a
+key, and neither is used before Phase 4.
 
-The Spark code is identical across both — only the storage URI (`s3a://` → `abfss://`) and the broker
-endpoint change. Deploy with `make azure-up`, tear down with `make azure-down`; a budget alert is part of
-the Terraform module, not an afterthought.
+That constraint is deliberate rather than a limitation. It means the repo is reproducible by anyone
+who clones it, it cannot rot when a free tier changes, and it never bills you for a portfolio project.
+Portability to managed infrastructure is proven in Phase 7 as a **design exercise** — Terraform that is
+validated but never applied, plus a storage-layer swap performed locally by configuration alone.
 
 ---
 

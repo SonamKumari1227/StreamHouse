@@ -1,0 +1,55 @@
+# StreamHouse — Python 3.11 only.
+#
+# PySpark 3.5.x supports Python 3.8-3.11. This machine defaults `py` to 3.13,
+# so always create the venv explicitly:   py -3.11 -m venv .venv
+#
+# Every version is pinned on purpose. An unpinned portfolio repo stops building
+# within a year, and pinning is itself a production habit worth showing.
+#
+# Nothing here is a cloud SDK. No azure-*, boto3, google-cloud-* or adlfs, by rule.
+# See CLAUDE.md.
+
+# ---------------------------------------------------------------- lakehouse core
+pyspark==3.5.3
+delta-spark==3.2.1
+
+# ---------------------------------------------------------------- streaming + contracts
+confluent-kafka==2.6.0
+fastavro==1.9.7
+
+# ---------------------------------------------------------------- source database
+psycopg[binary]==3.2.3
+
+# ---------------------------------------------------------------- quality
+great-expectations==0.18.22
+
+# ---------------------------------------------------------------- transform
+dbt-core==1.9.1
+dbt-spark[PyHive]==1.9.0
+
+# ---------------------------------------------------------------- orchestration
+apache-airflow==3.0.1
+
+# ---------------------------------------------------------------- lineage
+openlineage-python==1.24.2
+
+# ---------------------------------------------------------------- generator + extractors
+requests==2.32.3
+tenacity==9.0.0
+faker==30.8.2
+pydantic==2.9.2
+
+# ---------------------------------------------------------------- serving
+fastapi==0.115.5
+uvicorn==0.32.1
+streamlit==1.40.1
+prometheus-client==0.21.0
+
+# ---------------------------------------------------------------- dev
+pytest==8.3.3
+pytest-cov==6.0.0
+chispa==0.10.1
+testcontainers[postgres,kafka]==4.8.2
+ruff==0.8.4
+mypy==1.13.0
+pre-commit==4.0.1

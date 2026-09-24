@@ -269,7 +269,8 @@ consumers fails before it can merge. Data contracts enforced as code, not as pol
 
 ### 7.3 Runbook
 
-`docs/runbook.md` carries one entry per configured alert, in this shape:
+`docs/runbook.md` is the living operations doc — how to run the stack, verify each service, and fix
+common failures. From Phase 6 it also carries one entry per configured alert, in this shape:
 
 ```markdown
 ## ALERT: bronze_freshness_breach (> 15 min)

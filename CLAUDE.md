@@ -62,8 +62,12 @@ than building it.
 
 ### 3. Git is manual — the user owns it
 
-**Never run any git command.** Not `init`, not `add`, not `commit`, not `status`, not `log`, not
-`diff`. Create and edit files on disk and stop there. The user reviews and commits manually.
+**Never run a git command that changes anything.** No `init`, `add`, `commit`, `push`, `pull`,
+`merge`, `rebase`, `checkout`, `reset`, `stash`, `tag`, or `branch` creation. Create and edit files
+on disk and stop there. The user reviews, stages, commits and pushes manually.
+
+Read-only inspection is permitted when the user asks for it — `status`, `log`, `diff`, `remote -v`,
+`branch -vv`, `show`. Use it to keep the state block below accurate, not to act on the repo.
 
 ### 4. Ask before creating, modifying, or running
 
@@ -76,26 +80,77 @@ Show each file or group of files after creating it, then wait before continuing.
 
 | | |
 | --- | --- |
-| **Active phase** | **Phase 0 — Foundation** |
+| **Active phase** | **Phase 0 — COMPLETE and VERIFIED on a running stack (2026-09-24).** Phase 1 not started. |
 | Repo root | `E:\streamhouse-project\streamhouse\` |
-| Git | Not initialised. User handles all git manually. |
+| Git | Initialised. Remote `origin` → `https://github.com/SonamKumari1227/StreamHouse.git`, branch `master`. Last commit `c0753c5`. **Everything from item 3 onward is uncommitted** — `docs/decisions/`, `docs/runbook.md`, `infra/docker-compose.yml`, `infra/postgres/`, `Makefile`, `.env.example`, `requirements.txt`, plus edits to `CLAUDE.md`, `README.md`, `docs/README.md`, `docs/architecture.md`. **User handles all staging, commits and pushes manually.** |
+| IDE | PyCharm — `.idea/` present and already gitignored. |
 | Python 3.11 | Installed at `C:\Users\erson\AppData\Local\Programs\Python\Python311\python.exe`. `py` defaults to 3.13 — always invoke `py -3.11` explicitly. |
-| venv | Not created. Not needed until Phase 1 — all Phase 0 services are Docker-based. |
-| Docker | Running on the host. |
+| venv | **Not created — required now for Phase 1.** `py -3.11 -m venv .venv && pip install -r requirements.txt` |
+| Docker | 27.5.1, Compose v2.32.4. Core stack verified healthy. **GNU Make is NOT installed** — run the `docker compose` commands directly, or install it. |
 
 ### Phase 0 progress
 
 - [x] `CLAUDE.md`
 - [x] `docs/architecture.md` — trimmed design spec
-- [ ] Folder skeleton with per-folder README stubs
-- [ ] `docs/decisions/` — ADR template + ADR-0001 (log-based vs query-based CDC)
-- [ ] `infra/docker-compose.yml` — core profile with healthchecks
-- [ ] Postgres DDL + logical replication, verifiable via `SHOW wal_level;`
-- [ ] `.env.example`, `Makefile`, `requirements.txt`, `.gitignore`
-- [ ] `README.md` — strip Azure section, retitle Phase 7 (carried over from a prior session)
+- [x] Folder skeleton with per-folder README stubs
+- [x] `docs/decisions/` — ADR template + ADR-0001 (log-based vs query-based CDC)
+- [x] `docs/runbook.md` — local run guide; grows into the alert runbook in Phase 6
+- [x] `infra/docker-compose.yml` — core profile, healthchecks, `docker compose config` validated
+- [x] `infra/postgres/init/01-schema.sql` — 7 tables, idempotent, `REPLICA IDENTITY FULL` on `orders`
+- [x] `.env.example`, `Makefile`, `requirements.txt` — **`.gitignore` already existed; left alone**
+- [x] `README.md` — cloud references stripped, Phase 7 retitled, run instructions made truthful
 
 **Phase 0 is done when:** `make up` brings up a healthy core stack and
 `SELECT * FROM pg_replication_slots;` works against the Postgres container.
+
+**VERIFIED on a running stack, 2026-09-24.** Actual output:
+
+```
+sh-connect            Up (healthy)      sh-minio       Up (healthy)
+sh-postgres           Up (healthy)      sh-redpanda    Up (healthy)
+sh-spark-master       Up (healthy)      sh-spark-worker Up (healthy)
+sh-redpanda-console   Up               (no healthcheck by design; HTTP 200 confirmed)
+
+wal_level        : logical        <- the Phase 0 condition
+max_repl_slots   : 10
+max_wal_senders  : 10
+tables           : 7
+orders replident : f              <- REPLICA IDENTITY FULL
+repl slots       : 0              <- correct; Debezium registers in Phase 2
+redpanda         : Healthy: true
+schema registry  : []             <- correct until Phase 2
+connectors       : []             <- correct until Phase 2
+pg plugin        : PostgresConnector
+minio live       : OK
+spark master     : ALIVE, 1 worker registered, 2 cores / 2048 MB
+```
+
+Schema re-applied a second time to prove idempotency: only `... already exists, skipping` notices,
+no errors.
+
+**Caveat — the Makefile itself has never been executed.** GNU Make is not installed on this machine
+(`make: not on PATH`; not in GnuWin32, Chocolatey, Scoop or Anaconda either). Every verification
+above was run through the underlying `docker compose` commands that each target wraps. The targets
+are therefore unproven as written. Install Make (`winget install GnuWin32.Make`) and run
+`make up && make db-init && make health` to close this gap.
+
+### Bugs found and fixed during verification
+
+1. **`.env` not read.** Compose resolves `.env` relative to the compose file's directory (`infra/`),
+   not the working directory. Fixed: `--env-file .env` in the Makefile's `COMPOSE` variable.
+2. **`debezium/connect:2.7` does not exist.** Debezium publishes only `X.Y.Z.Final` tags. Fixed:
+   `debezium/connect:2.7.3.Final`.
+3. **`minio/minio` on Docker Hub now requires authentication** (`denied: requested access to the
+   resource is denied`). MinIO publishes publicly to quay.io. Fixed:
+   `quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z`.
+4. **Host environment silently overrode `.env`.** This machine exports `POSTGRES_USER=ca.team`, and
+   Compose gives the shell environment precedence over `.env` — so Postgres initialised with the
+   wrong role and every connection failed with `role "streamhouse" does not exist`. Fixed by
+   prefixing every project variable with `SH_` (`SH_POSTGRES_USER`, etc.), which makes ambient
+   collisions effectively impossible. **Do not remove the prefix.**
+5. **Git Bash path mangling.** `psql -f /docker-entrypoint-initdb.d/01-schema.sql` was rewritten by
+   MSYS into `C:/Program Files/Git/docker-entrypoint-initdb.d/...`. Fixed: `db-init` now pipes the
+   host file into `psql` on stdin, which is also mount-independent.
 
 ### Known deviation from spec
 
@@ -112,8 +167,8 @@ Each phase ends in something demoable. Never leave the repo in a broken state.
 
 | Phase | Scope | Status |
 | --- | --- | --- |
-| 0 | Foundation — repo skeleton, core Compose profile, Postgres DDL + logical replication, ADR-0001 | **ACTIVE** |
-| 1 | Source simulation — OLTP generator (Faker + order state machine), GPS producer, `--chaos` flag | Not started |
+| 0 | Foundation — repo skeleton, core Compose profile, Postgres DDL + logical replication, ADR-0001, runbook | **DONE, verified 2026-09-24** |
+| 1 | Source simulation — OLTP generator (Faker + order state machine), GPS producer, `--chaos` flag | **ACTIVE** |
 | 2 | CDC ingestion + contracts — Debezium connector, Avro schemas registered `BACKWARD`, Bronze streaming, DLQ, exactly-once | Not started |
 | 3 | Silver — SCD2 via Delta `MERGE`, dedup on `(pk, lsn)`, GPS sessionization, GE gate, `OPTIMIZE`/`ZORDER` | Not started |
 | 4 | Gold — dbt star schema, `dim_date` from Nager.Date, Open-Meteo join, generic + singular tests, docs | Not started |
