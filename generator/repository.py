@@ -17,6 +17,7 @@ the kind of multi-event-per-entity traffic Phase 3 has to deduplicate correctly.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "Catalog",
+    "LogicalSlot",
     "MenuItem",
     "NewOrder",
     "OpenOrder",
@@ -345,3 +347,92 @@ class PostgresRepository:
             "UPDATE riders SET tier = %s, is_online = %s, updated_at = %s WHERE rider_id = %s",
             (tier, is_online, updated_at, rider_id),
         )
+
+
+# ---------------------------------------------------------------- change capture
+
+
+#: Only these tables are watched; the parser below understands their primary keys.
+_PK_BY_TABLE: dict[str, str] = {
+    "orders": "order_id",
+    "order_items": "order_item_id",
+    "payments": "payment_id",
+    "customers": "customer_id",
+    "restaurants": "restaurant_id",
+    "menu_items": "menu_item_id",
+    "riders": "rider_id",
+}
+
+_CHANGE_RE = re.compile(
+    r"^table public\.(?P<table>\w+): (?P<op>INSERT|UPDATE|DELETE): .*?"
+    r"(?P<pk_col>\w+)\[bigint\]:(?P<pk>\d+)"
+)
+
+
+class LogicalSlot:
+    """A temporary logical replication slot, for observing real per-change LSNs.
+
+    This is **not** CDC ingestion — that is Phase 2 and belongs to Debezium. It exists so
+    Phase 1 can prove the `(table, pk, lsn)` dedup key against genuine WAL positions instead
+    of invented ones.
+
+    `peek()` reads changes **without advancing** the slot, so calling it twice returns the
+    same changes with the same LSNs. That is precisely what a restarted Debezium connector
+    does, which makes it a faithful duplicate-delivery scenario rather than a mock.
+
+    **The slot must be dropped.** An inactive slot retains WAL forever and will fill the
+    source disk — the hazard ADR-0001 names. Use it as a context manager and it always is.
+    """
+
+    def __init__(self, cursor: _Cursor, name: str, plugin: str = "test_decoding") -> None:
+        self._cur = cursor
+        self.name = name
+        self._plugin = plugin
+        self.created = False
+
+    def __enter__(self) -> LogicalSlot:
+        self._cur.execute(
+            "SELECT pg_create_logical_replication_slot(%s, %s)", (self.name, self._plugin)
+        )
+        self.created = True
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.drop()
+
+    def drop(self) -> None:
+        if not self.created:
+            return
+        self._cur.execute(
+            "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
+            "WHERE slot_name = %s",
+            (self.name,),
+        )
+        self.created = False
+
+    def peek(self) -> tuple[tuple[str, int, str], ...]:
+        """Read pending changes **without** consuming them, as (table, pk, lsn).
+
+        BEGIN/COMMIT markers carry no row identity and are skipped.
+        """
+        self._cur.execute(
+            "SELECT lsn::text, data FROM pg_logical_slot_peek_changes(%s, NULL, NULL)",
+            (self.name,),
+        )
+        changes = []
+        for lsn, data in self._cur.fetchall():
+            match = _CHANGE_RE.match(str(data))
+            if match is None:
+                continue  # BEGIN / COMMIT / a table we do not track
+            table = match.group("table")
+            if _PK_BY_TABLE.get(table) != match.group("pk_col"):
+                continue
+            changes.append((table, int(match.group("pk")), str(lsn)))
+        return tuple(changes)
+
+    def consume(self) -> int:
+        """Advance the slot, discarding pending changes. Returns how many were dropped."""
+        self._cur.execute(
+            "SELECT count(*) FROM pg_logical_slot_get_changes(%s, NULL, NULL)", (self.name,)
+        )
+        return int(self._cur.fetchone()[0])

@@ -47,6 +47,7 @@ from generator.state_machine import (
     MachineConfig,
     OrderState,
     OrderStatus,
+    Transition,
     advance,
     apply_transition,
     is_terminal,
@@ -55,7 +56,7 @@ from generator.state_machine import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 __all__ = [
     "Clock",
@@ -157,7 +158,11 @@ class OltpGenerator:
         machine: MachineConfig | None = None,
         rng: random.Random | None = None,
         clock: Clock | None = None,
+        transition_hook: Callable[[Transition], Transition] | None = None,
     ) -> None:
+        # The single seam chaos uses. None means every transition passes through untouched,
+        # so a run without --chaos is byte-identical to one before chaos existed.
+        self.transition_hook = transition_hook
         self.repo = repository
         self.load = load or LoadConfig()
         self.machine = machine or DEFAULT_CONFIG
@@ -307,6 +312,8 @@ class OltpGenerator:
         transition = advance(state, now, self.rng, self.machine)
         if transition is None:
             return
+        if self.transition_hook is not None:
+            transition = self.transition_hook(transition)
 
         # A rider is assigned at the moment the restaurant accepts, not before.
         rider_id = (

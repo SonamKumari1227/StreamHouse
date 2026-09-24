@@ -80,7 +80,7 @@ Show each file or group of files after creating it, then wait before continuing.
 
 | | |
 | --- | --- |
-| **Active phase** | **Phase 1 — Source simulation.** All done and verified except `chaos.py` and `__main__.py`. Next: chaos scenarios, starting with duplicates. |
+| **Active phase** | **Phase 1 — COMPLETE and verified 2026-09-24.** Phase 2 (CDC ingestion + contracts) is next and has not started. |
 | Repo root | `E:\streamhouse-project\streamhouse\` |
 | Git | Initialised. Remote `origin` → `https://github.com/SonamKumari1227/StreamHouse.git`, branch `master`. Last commit `c0753c5`. **Everything from item 3 onward is uncommitted** — `docs/decisions/`, `docs/runbook.md`, `infra/docker-compose.yml`, `infra/postgres/`, `Makefile`, `.env.example`, `requirements.txt`, plus edits to `CLAUDE.md`, `README.md`, `docs/README.md`, `docs/architecture.md`. **User handles all staging, commits and pushes manually.** |
 | IDE | PyCharm — `.idea/` present and already gitignored. |
@@ -187,17 +187,20 @@ Make 4.x features in this Makefile without testing them first.
 - [x] `generator/gps_producer.py` — Avro pings to Redpanda at ~200 msg/s
 - [x] `tests/unit/test_gps_producer.py` — 47 tests, no broker
 - [x] `tests/integration/test_gps_producer_redpanda.py` — 9 tests against real Redpanda
-- [ ] `generator/chaos.py` — named composable scenarios
-- [ ] `generator/__main__.py` — CLI
+- [x] `generator/chaos.py` — named composable scenarios (duplicates, out-of-order)
+- [x] `tests/unit/test_chaos.py` — 42 tests
+- [x] `tests/integration/test_chaos_duplicates.py` — 10 tests, real logical decoding
+- [x] `generator/__main__.py` — CLI
+- [x] `tests/unit/test_cli.py` + `tests/integration/test_cli_modes.py` — 23+12 tests
 
 **Verified 2026-09-24**, actual output:
 
 ```
 ruff check           : All checks passed!
-ruff format --check  : 15 files already formatted
-mypy (strict)        : Success: no issues found in 15 source files
-full suite           : 242 passed in 56s   (unit + integration)
-coverage             : generator/  902 stmts, 0 miss, 100%
+ruff format --check  : 21 files already formatted
+mypy (strict)        : Success: no issues found in 21 source files
+full suite           : 329 passed in 90s   (unit + integration)
+coverage             : generator/  1210 stmts, 7 miss, 99%
 ```
 
 **Committed GPS demo**, real messages on a real topic:
@@ -303,6 +306,35 @@ State machine design, for anyone extending it:
   which made arrival time unrelated to the distance supposedly covered — `trips_started` sat
   at 0 through a 20s demo. After the fix the same run produced 3 trip rollovers.
 
+### Chaos and the dedup key (Phase 1)
+
+- **A duplicate is the same WAL record delivered twice, not the same write repeated.**
+  Re-running an `UPDATE` produces a genuinely new change with its own LSN, and dedup that
+  rejected it would silently drop real history. The identity of a change is
+  `(table, pk, lsn)` — `chaos.DedupLedger` keys on exactly that, and Phase 3 expresses the
+  same key as a Delta `MERGE` predicate.
+- **`pg_current_wal_lsn()` is NOT a per-change LSN.** Measured: six writes inside one
+  transaction returned **two** distinct values. It reports the WAL insert pointer. Keying on
+  it would reject legitimate changes. Per-change LSNs come from logical decoding only.
+- **`pg_logical_slot_peek_changes` is non-destructive**, so calling it twice returns the same
+  changes with the same LSNs. That *is* a restarted Debezium connector replaying an
+  un-advanced slot — a faithful reproduction, not a simulation. `repository.LogicalSlot`
+  wraps it; it is a Phase 1 test harness, **not** CDC ingestion, which is Phase 2.
+- **Always drop the slot.** `LogicalSlot` is a context manager for that reason. An inactive
+  slot retains WAL forever and fills the source disk — ADR-0001's named hazard.
+- **`--chaos duplicates` reports 0 from the CLI, by design.** The generator writes; it does
+  not deliver. There is no delivery path until Phase 2, and the CLI says so on stderr rather
+  than printing a silent zero.
+- Five scenarios remain unimplemented and are rejected **by name with their phase**, so a
+  typo and a not-yet-built scenario produce different errors.
+
+### CLI performance traps
+
+- **`--orders N` drains every in-flight order before returning**, and `RealClock` genuinely
+  sleeps. At the default 20x a lifecycle is ~90s, so `--orders 15` took 162s in a test.
+  Bound it with `--duration`, or raise `--speed` (500x makes a lifecycle ~3.6s). This cut the
+  CLI integration suite from 347s to 31s.
+
 ### Integration test conventions
 
 - Fixtures clear **dependent tables first** (`order_items`, `payments`, `orders`), then the
@@ -343,8 +375,8 @@ Each phase ends in something demoable. Never leave the repo in a broken state.
 | Phase | Scope | Status |
 | --- | --- | --- |
 | 0 | Foundation — repo skeleton, core Compose profile, Postgres DDL + logical replication, ADR-0001, runbook | **DONE, verified 2026-09-24** |
-| 1 | Source simulation — OLTP generator (Faker + order state machine), GPS producer, `--chaos` flag | **ACTIVE** — OLTP generator and GPS producer done; chaos and CLI remain |
-| 2 | CDC ingestion + contracts — Debezium connector, Avro schemas registered `BACKWARD`, Bronze streaming, DLQ, exactly-once | Not started |
+| 1 | Source simulation — OLTP generator (Faker + order state machine), GPS producer, `--chaos` flag | **DONE, verified 2026-09-24** |
+| 2 | CDC ingestion + contracts — Debezium connector, Avro schemas registered `BACKWARD`, Bronze streaming, DLQ, exactly-once | **NEXT** |
 | 3 | Silver — SCD2 via Delta `MERGE`, dedup on `(pk, lsn)`, GPS sessionization, GE gate, `OPTIMIZE`/`ZORDER` | Not started |
 | 4 | Gold — dbt star schema, `dim_date` from Nager.Date, Open-Meteo join, generic + singular tests, docs | Not started |
 | 5 | Orchestration — Airflow 3 DAGs, dynamic task mapping, idempotent backfills, SLA callbacks | Not started |
