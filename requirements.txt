@@ -14,7 +14,10 @@ pyspark==3.5.3
 delta-spark==3.2.1
 
 # ---------------------------------------------------------------- streaming + contracts
-confluent-kafka==2.6.0
+# 2.6.0 is a REGRESSION: librdkafka 2.6.0 sends Fetch API v12 even when the broker
+# advertises a maximum of 11, so producing works and consuming silently returns nothing.
+# Redpanda logs `Unsupported version 12 for fetch API`. Fixed in 2.6.1. Do not pin 2.6.0.
+confluent-kafka==2.6.1
 fastavro==1.9.7
 
 # ---------------------------------------------------------------- source database

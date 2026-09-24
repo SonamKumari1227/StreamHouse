@@ -27,6 +27,7 @@ from generator.config import (
     VEHICLE_TYPES,
     Range,
     SeedVolumes,
+    dish_names,
 )
 from generator.seed import (
     ReferenceData,
@@ -195,7 +196,7 @@ def test_dish_names_come_from_the_restaurants_own_cuisine() -> None:
     items = build_menu_items(restaurants, SMALL, random.Random(14), NOW)
     cuisine_by_id = {r.restaurant_id: r.cuisine for r in restaurants}
     for item in items:
-        assert item.name in DISHES[cuisine_by_id[item.restaurant_id]]
+        assert item.name in dish_names(cuisine_by_id[item.restaurant_id])
 
 
 def test_no_restaurant_lists_the_same_dish_twice() -> None:
@@ -384,11 +385,12 @@ def test_seed_report_totals() -> None:
 def test_every_cuisine_has_dishes() -> None:
     assert set(DISHES) == set(CUISINES)
     for cuisine, dishes in DISHES.items():
+        names = [d.name for d in dishes]
         assert len(dishes) >= 5, f"{cuisine} has too few dishes to build a menu"
-        assert len(set(dishes)) == len(dishes), f"{cuisine} lists a duplicate dish"
+        assert len(set(names)) == len(names), f"{cuisine} lists a duplicate dish"
 
 
 def test_dish_names_fit_in_a_reasonable_column() -> None:
     for dishes in DISHES.values():
         for dish in dishes:
-            assert 0 < len(dish) <= 60
+            assert 0 < len(dish.name) <= 60

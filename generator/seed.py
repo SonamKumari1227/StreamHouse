@@ -32,7 +32,6 @@ from generator.config import (
     CUSTOMER_TIERS,
     DEFAULT_RNG_SEED,
     DISHES,
-    MENU_PRICE_INR,
     RESTAURANT_RATING,
     RIDER_TIER_WEIGHTS,
     RIDER_TIERS,
@@ -250,14 +249,15 @@ def build_menu_items(
         # Never more items than the cuisine has distinct dishes: a duplicate dish name
         # within one restaurant would be indistinguishable in the Gold star schema.
         count = max(1, min(wanted, len(dishes)))
-        for name in rng.sample(dishes, count):
+        for dish in rng.sample(dishes, count):
             menu_item_id += 1
             rows.append(
                 MenuItemRow(
                     menu_item_id=menu_item_id,
                     restaurant_id=restaurant.restaurant_id,
-                    name=name,
-                    price_inr=round(MENU_PRICE_INR.sample(rng), 2),
+                    name=dish.name,
+                    # Priced from the dish's own band, not one flat menu-wide distribution.
+                    price_inr=dish.sample_price(rng),
                     is_available=rng.random() < 0.93,
                     updated_at=now,
                 )

@@ -21,6 +21,7 @@ from generator.config import (
     CUISINES,
     CUSTOMER_TIER_WEIGHTS,
     CUSTOMER_TIERS,
+    DISHES,
     ITEMS_PER_ORDER,
     MENU_PRICE_INR,
     PAYMENT_METHOD_WEIGHTS,
@@ -32,9 +33,11 @@ from generator.config import (
     VEHICLE_TYPE_WEIGHTS,
     VEHICLE_TYPES,
     City,
+    Dish,
     LoadConfig,
     Range,
     SeedVolumes,
+    dish_names,
     pick_city,
 )
 from generator.state_machine import OrderStatus
@@ -267,3 +270,68 @@ def test_gps_defaults_match_the_spec() -> None:
     load = LoadConfig()
     assert load.gps_ping_interval_s == 5.0
     assert load.gps_max_msgs_per_second == 200
+
+
+# --------------------------------------------------------------------------- dish pricing
+
+
+def test_every_dish_band_sits_inside_the_global_envelope() -> None:
+    """A mistyped band should fail here, not reach the database."""
+    for cuisine, dishes in DISHES.items():
+        for dish in dishes:
+            assert dish.low_inr >= MENU_PRICE_INR.low, f"{cuisine}/{dish.name} too cheap"
+            assert dish.high_inr <= MENU_PRICE_INR.high, f"{cuisine}/{dish.name} too expensive"
+
+
+def test_sampled_prices_stay_inside_their_own_band() -> None:
+    rng = random.Random(21)
+    for dishes in DISHES.values():
+        for dish in dishes:
+            for _ in range(200):
+                price = dish.sample_price(rng)
+                assert dish.low_inr <= price <= dish.high_inr
+                assert round(price, 2) == price, "price must fit NUMERIC(10,2)"
+
+
+def test_a_bread_never_costs_more_than_a_biryani() -> None:
+    """The exact realism bug this replaced: one flat band priced naan above mutton biryani."""
+    naan = next(d for d in DISHES["North Indian"] if d.name == "Butter Naan")
+    biryani = next(d for d in DISHES["Biryani"] if d.name == "Mutton Biryani")
+    assert naan.high_inr < biryani.low_inr
+
+
+def test_sides_are_cheaper_than_mains_within_a_cuisine() -> None:
+    for cuisine, side, main in (
+        ("North Indian", "Butter Naan", "Paneer Butter Masala"),
+        ("Chinese", "Hot and Sour Soup", "Chicken Lollipop"),
+        ("Pizza", "Cheese Garlic Bread", "Pepperoni"),
+        ("Street Food", "Vada Pav", "Kathi Roll"),
+    ):
+        s = next(d for d in DISHES[cuisine] if d.name == side)
+        m = next(d for d in DISHES[cuisine] if d.name == main)
+        assert s.mode_inr < m.mode_inr, f"{side} should cost less than {main}"
+
+
+def test_non_veg_biryani_costs_more_than_veg() -> None:
+    veg = next(d for d in DISHES["Biryani"] if d.name == "Veg Dum Biryani")
+    mutton = next(d for d in DISHES["Biryani"] if d.name == "Mutton Biryani")
+    assert veg.mode_inr < mutton.mode_inr
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"name": "", "low_inr": 10, "high_inr": 20, "mode_inr": 15}, "must not be empty"),
+        ({"name": "X", "low_inr": 0, "high_inr": 20, "mode_inr": 15}, "low_inr must be > 0"),
+        ({"name": "X", "low_inr": 30, "high_inr": 20, "mode_inr": 25}, "low <= mode <= high"),
+    ],
+    ids=["empty name", "zero floor", "inverted band"],
+)
+def test_dish_rejects_invalid_bands(kwargs: dict[str, object], match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        Dish(**kwargs)  # type: ignore[arg-type]
+
+
+def test_dish_names_helper_matches_the_dishes() -> None:
+    for cuisine, dishes in DISHES.items():
+        assert dish_names(cuisine) == tuple(d.name for d in dishes)

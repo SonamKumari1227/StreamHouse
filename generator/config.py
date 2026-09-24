@@ -36,9 +36,11 @@ __all__ = [
     "VEHICLE_TYPES",
     "VEHICLE_TYPE_WEIGHTS",
     "City",
+    "Dish",
     "LoadConfig",
     "Range",
     "SeedVolumes",
+    "dish_names",
     "pick_city",
 ]
 
@@ -125,99 +127,134 @@ CUISINES: tuple[str, ...] = (
     "Cafe",
 )
 
-#: Menu vocabulary per cuisine. Every cuisine in CUISINES must have an entry; a test
-#: enforces that, so adding a cuisine cannot silently produce restaurants with no menu.
-DISHES: dict[str, tuple[str, ...]] = {
+
+@dataclass(frozen=True, slots=True)
+class Dish:
+    """A menu item and its own price band, in INR.
+
+    Prices are per dish rather than one distribution across the whole menu. A single flat
+    band produced a naan costing more than a biryani, which is harmless for pipeline
+    mechanics and immediately silly in a screenshot.
+    """
+
+    name: str
+    low_inr: float
+    high_inr: float
+    mode_inr: float
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("dish name must not be empty")
+        if self.low_inr <= 0:
+            raise ValueError(f"{self.name}: low_inr must be > 0, got {self.low_inr}")
+        if not self.low_inr <= self.mode_inr <= self.high_inr:
+            raise ValueError(
+                f"{self.name}: require low <= mode <= high, got "
+                f"{self.low_inr} / {self.mode_inr} / {self.high_inr}"
+            )
+
+    def sample_price(self, rng: random.Random) -> float:
+        return round(rng.triangular(self.low_inr, self.high_inr, self.mode_inr), 2)
+
+
+def dish_names(cuisine: str) -> tuple[str, ...]:
+    return tuple(d.name for d in DISHES[cuisine])
+
+
+#: Menu vocabulary per cuisine, each dish carrying its own price band. Every cuisine in
+#: CUISINES must have an entry, and every band must sit inside MENU_PRICE_INR; tests enforce
+#: both, so adding a cuisine cannot silently produce restaurants with no menu.
+DISHES: dict[str, tuple[Dish, ...]] = {
     "North Indian": (
-        "Paneer Butter Masala",
-        "Dal Makhani",
-        "Chole Bhature",
-        "Rajma Chawal",
-        "Butter Naan",
-        "Kadhai Paneer",
-        "Aloo Paratha",
-        "Malai Kofta",
+        Dish("Paneer Butter Masala", 220, 380, 280),
+        Dish("Dal Makhani", 180, 320, 240),
+        Dish("Chole Bhature", 120, 240, 170),
+        Dish("Rajma Chawal", 130, 250, 180),
+        Dish("Butter Naan", 40, 90, 55),
+        Dish("Kadhai Paneer", 230, 390, 290),
+        Dish("Aloo Paratha", 70, 150, 100),
+        Dish("Malai Kofta", 220, 370, 285),
     ),
     "South Indian": (
-        "Masala Dosa",
-        "Idli Sambar",
-        "Medu Vada",
-        "Rava Upma",
-        "Filter Coffee",
-        "Pongal",
-        "Uttapam",
-        "Lemon Rice",
+        Dish("Masala Dosa", 90, 190, 130),
+        Dish("Idli Sambar", 60, 140, 90),
+        Dish("Medu Vada", 60, 130, 85),
+        Dish("Rava Upma", 60, 130, 85),
+        Dish("Filter Coffee", 40, 90, 55),
+        Dish("Pongal", 80, 160, 110),
+        Dish("Uttapam", 90, 180, 125),
+        Dish("Lemon Rice", 70, 150, 100),
     ),
     "Biryani": (
-        "Hyderabadi Chicken Biryani",
-        "Mutton Biryani",
-        "Veg Dum Biryani",
-        "Egg Biryani",
-        "Prawn Biryani",
-        "Mirchi ka Salan",
-        "Double ka Meetha",
+        Dish("Hyderabadi Chicken Biryani", 260, 480, 340),
+        Dish("Mutton Biryani", 340, 620, 430),
+        Dish("Veg Dum Biryani", 190, 340, 240),
+        Dish("Egg Biryani", 180, 320, 230),
+        Dish("Prawn Biryani", 320, 580, 410),
+        Dish("Mirchi ka Salan", 70, 150, 100),
+        Dish("Double ka Meetha", 80, 170, 115),
     ),
     "Chinese": (
-        "Veg Hakka Noodles",
-        "Chilli Paneer",
-        "Schezwan Fried Rice",
-        "Manchurian Gravy",
-        "Spring Rolls",
-        "Chicken Lollipop",
-        "Hot and Sour Soup",
+        Dish("Veg Hakka Noodles", 140, 260, 185),
+        Dish("Chilli Paneer", 190, 340, 250),
+        Dish("Schezwan Fried Rice", 150, 280, 200),
+        Dish("Manchurian Gravy", 170, 300, 225),
+        Dish("Spring Rolls", 110, 220, 155),
+        Dish("Chicken Lollipop", 200, 360, 265),
+        Dish("Hot and Sour Soup", 100, 200, 140),
     ),
     "Pizza": (
-        "Margherita",
-        "Farmhouse",
-        "Peppy Paneer",
-        "Chicken Tikka Pizza",
-        "Cheese Garlic Bread",
-        "Pepperoni",
-        "Veggie Supreme",
+        Dish("Margherita", 180, 340, 240),
+        Dish("Farmhouse", 280, 520, 370),
+        Dish("Peppy Paneer", 290, 540, 385),
+        Dish("Chicken Tikka Pizza", 320, 600, 430),
+        Dish("Cheese Garlic Bread", 110, 220, 155),
+        Dish("Pepperoni", 340, 640, 460),
+        Dish("Veggie Supreme", 300, 560, 400),
     ),
     "Burgers": (
-        "Aloo Tikki Burger",
-        "Chicken Maharaja",
-        "Veg Cheese Burger",
-        "Crispy Chicken Burger",
-        "Peri Peri Fries",
-        "Double Patty Burger",
+        Dish("Aloo Tikki Burger", 60, 130, 85),
+        Dish("Chicken Maharaja", 180, 330, 245),
+        Dish("Veg Cheese Burger", 100, 200, 140),
+        Dish("Crispy Chicken Burger", 150, 280, 205),
+        Dish("Peri Peri Fries", 90, 180, 125),
+        Dish("Double Patty Burger", 200, 370, 270),
     ),
     "Street Food": (
-        "Pani Puri",
-        "Bhel Puri",
-        "Vada Pav",
-        "Pav Bhaji",
-        "Samosa Chaat",
-        "Dahi Puri",
-        "Momos",
-        "Kathi Roll",
+        Dish("Pani Puri", 40, 100, 60),
+        Dish("Bhel Puri", 50, 110, 70),
+        Dish("Vada Pav", 25, 70, 40),
+        Dish("Pav Bhaji", 90, 190, 130),
+        Dish("Samosa Chaat", 60, 130, 85),
+        Dish("Dahi Puri", 60, 130, 85),
+        Dish("Momos", 90, 190, 130),
+        Dish("Kathi Roll", 110, 220, 155),
     ),
     "Desserts": (
-        "Gulab Jamun",
-        "Rasmalai",
-        "Chocolate Brownie",
-        "Gajar ka Halwa",
-        "Tiramisu",
-        "Kulfi Falooda",
-        "Cheesecake Slice",
+        Dish("Gulab Jamun", 60, 140, 90),
+        Dish("Rasmalai", 80, 170, 115),
+        Dish("Chocolate Brownie", 100, 210, 145),
+        Dish("Gajar ka Halwa", 90, 190, 130),
+        Dish("Tiramisu", 180, 340, 245),
+        Dish("Kulfi Falooda", 90, 190, 130),
+        Dish("Cheesecake Slice", 170, 330, 235),
     ),
     "Healthy": (
-        "Quinoa Bowl",
-        "Grilled Chicken Salad",
-        "Sprouts Salad",
-        "Oats Smoothie Bowl",
-        "Paneer Tikka Salad",
-        "Fruit Bowl",
+        Dish("Quinoa Bowl", 220, 400, 300),
+        Dish("Grilled Chicken Salad", 240, 430, 320),
+        Dish("Sprouts Salad", 120, 230, 165),
+        Dish("Oats Smoothie Bowl", 180, 330, 240),
+        Dish("Paneer Tikka Salad", 210, 380, 285),
+        Dish("Fruit Bowl", 110, 220, 155),
     ),
     "Cafe": (
-        "Cappuccino",
-        "Cold Coffee",
-        "Chicken Sandwich",
-        "Veg Club Sandwich",
-        "Blueberry Muffin",
-        "Croissant",
-        "Iced Latte",
+        Dish("Cappuccino", 130, 260, 180),
+        Dish("Cold Coffee", 140, 270, 190),
+        Dish("Chicken Sandwich", 160, 300, 220),
+        Dish("Veg Club Sandwich", 140, 270, 195),
+        Dish("Blueberry Muffin", 90, 190, 130),
+        Dish("Croissant", 100, 210, 145),
+        Dish("Iced Latte", 150, 290, 205),
     ),
 }
 
@@ -247,8 +284,9 @@ PAYMENT_STATUSES: tuple[str, ...] = (
 
 # ---------------------------------------------------------------- value distributions
 
-#: Menu item price. Long right tail: most items are cheap, a few are a family platter.
-MENU_PRICE_INR: Range = Range(low=49.0, high=899.0, mode=189.0)
+#: The overall envelope every per-dish band must sit inside. Not used to price anything —
+#: it exists so a badly-entered Dish band fails a test instead of reaching the database.
+MENU_PRICE_INR: Range = Range(low=20.0, high=700.0, mode=189.0)
 
 #: Platform commission taken from the restaurant.
 COMMISSION_PCT: Range = Range(low=12.0, high=28.0, mode=20.0)

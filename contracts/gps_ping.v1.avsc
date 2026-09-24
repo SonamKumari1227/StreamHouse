@@ -1,0 +1,51 @@
+{
+  "type": "record",
+  "name": "GpsPing",
+  "namespace": "streamhouse.gps",
+  "doc": "One GPS position report from a rider's device. Append-only, high volume (~200 msg/s). Phase 3 sessionizes these into trips using event_ts with a watermark.",
+  "fields": [
+    {
+      "name": "rider_id",
+      "type": "long",
+      "doc": "riders.rider_id in the OLTP source."
+    },
+    {
+      "name": "trip_id",
+      "type": "string",
+      "doc": "Stable id for one continuous leg of movement. Sessionization must agree with this, so it is carried explicitly rather than inferred."
+    },
+    {
+      "name": "lat",
+      "type": "double",
+      "doc": "WGS84 latitude, degrees."
+    },
+    {
+      "name": "lon",
+      "type": "double",
+      "doc": "WGS84 longitude, degrees."
+    },
+    {
+      "name": "speed_kmph",
+      "type": "double",
+      "doc": "Instantaneous ground speed. Zero while the rider is stationary."
+    },
+    {
+      "name": "heading_deg",
+      "type": "double",
+      "doc": "Compass bearing 0-360, 0 = north."
+    },
+    {
+      "name": "accuracy_m",
+      "type": "double",
+      "doc": "Reported horizontal accuracy. Degrades in dense urban areas, which is what makes a naive distance calculation noisy."
+    },
+    {
+      "name": "event_ts",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      },
+      "doc": "When the device recorded the fix. NOT when it arrived: chaos scenario 1 delays delivery well past this, which is exactly what the Phase 3 watermark has to cope with."
+    }
+  ]
+}

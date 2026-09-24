@@ -39,4 +39,5 @@ spark-warehouse/
 
 # OS
 .DS_Store
-Thumbs.db
+Thumbs.db.coverage
+htmlcov/

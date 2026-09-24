@@ -47,7 +47,10 @@ services:
 
   # ---------------------------------------------------------------- message bus
   redpanda:
-    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    # v24.2.x rejects Fetch API v12, which librdkafka 2.6 (confluent-kafka) negotiates:
+    #   WARN kafka - Unsupported version 12 for fetch API
+    # Producing worked, consuming did not. 24.3+ supports it. Do not downgrade.
+    image: docker.redpanda.com/redpandadata/redpanda:v24.3.11
     container_name: sh-redpanda
     profiles: ["core"]
     command:

@@ -80,7 +80,7 @@ Show each file or group of files after creating it, then wait before continuing.
 
 | | |
 | --- | --- |
-| **Active phase** | **Phase 1 — Source simulation.** `state_machine.py`, `config.py`, `seed.py`, `repository.py`, `oltp_generator.py` done and verified against real Postgres. Next: `gps_producer.py`. |
+| **Active phase** | **Phase 1 — Source simulation.** All done and verified except `chaos.py` and `__main__.py`. Next: chaos scenarios, starting with duplicates. |
 | Repo root | `E:\streamhouse-project\streamhouse\` |
 | Git | Initialised. Remote `origin` → `https://github.com/SonamKumari1227/StreamHouse.git`, branch `master`. Last commit `c0753c5`. **Everything from item 3 onward is uncommitted** — `docs/decisions/`, `docs/runbook.md`, `infra/docker-compose.yml`, `infra/postgres/`, `Makefile`, `.env.example`, `requirements.txt`, plus edits to `CLAUDE.md`, `README.md`, `docs/README.md`, `docs/architecture.md`. **User handles all staging, commits and pushes manually.** |
 | IDE | PyCharm — `.idea/` present and already gitignored. |
@@ -183,7 +183,10 @@ Make 4.x features in this Makefile without testing them first.
 - [x] `generator/oltp_generator.py` — the daemon: arrivals, transitions, mutations, recovery
 - [x] `tests/unit/test_oltp_generator.py` — 45 tests against a fake repository
 - [x] `tests/integration/test_oltp_generator_writes.py` — 15 tests against real Postgres
-- [ ] `generator/gps_producer.py` — Avro pings to Redpanda
+- [x] `contracts/gps_ping.v1.avsc` — the GPS contract, every field documented
+- [x] `generator/gps_producer.py` — Avro pings to Redpanda at ~200 msg/s
+- [x] `tests/unit/test_gps_producer.py` — 47 tests, no broker
+- [x] `tests/integration/test_gps_producer_redpanda.py` — 9 tests against real Redpanda
 - [ ] `generator/chaos.py` — named composable scenarios
 - [ ] `generator/__main__.py` — CLI
 
@@ -191,12 +194,19 @@ Make 4.x features in this Makefile without testing them first.
 
 ```
 ruff check           : All checks passed!
-ruff format --check  : 12 files already formatted
-mypy (strict)        : Success: no issues found in 12 source files
-pytest               : 154 passed, 23 deselected      (unit only)
-pytest -m integration: 23 passed, 154 deselected in 46s (real Postgres)
-full suite           : 177 passed in 58s
-coverage             : generator/  693 stmts, 0 miss, 100%
+ruff format --check  : 15 files already formatted
+mypy (strict)        : Success: no issues found in 15 source files
+full suite           : 242 passed in 56s   (unit + integration)
+coverage             : generator/  902 stmts, 0 miss, 100%
+```
+
+**Committed GPS demo**, real messages on a real topic:
+
+```
+topic gps.pings, 6 partitions, high watermarks 729+741+454+902+775+399 = 4000
+pings=4000  trips_started=3  avg_msg=57.6B  throughput=199 msg/s  failures=none
+consumed 4000 back: 120 distinct riders, 123 distinct trips, 499 stationary pings
+one message: 57 bytes on the wire, decodes cleanly against contracts/gps_ping.v1.avsc
 ```
 
 **Committed demo run**, not a rolled-back test — real rows in the dev database:
@@ -264,6 +274,35 @@ State machine design, for anyone extending it:
 - **`advance_order` validates the timestamp column against an allowlist** because that name is
   interpolated into SQL. Everything else is parameterised.
 
+### Kafka / Redpanda pinning — do not "simplify" these
+
+- **`confluent-kafka` must be >= 2.6.1.** librdkafka **2.6.0 is a regression**: it sends
+  Fetch API v12 even when the broker advertises a maximum of 11. Producing works and
+  consuming silently returns **nothing** — no exception, no error, just zero messages. The
+  broker logs `Unsupported version 12 for fetch API`. Diagnosed by dumping the negotiated
+  ApiVersions: the broker declared `Fetch (1) Versions 4..11`. Verified: 2.4.0, 2.5.3, 2.6.1,
+  2.8.0 and 2.11.1 all work; only 2.6.0 fails.
+- **Redpanda is on `v24.3.11`.** The upgrade from v24.2.7 was **not** the fix — the client pin
+  was. v24.3.11 is kept because it is current and stable here. **`v25.2.3` crashes on this
+  machine** (SIGILL, exit 132, Seastar backtrace). Do not move to 25.x without testing.
+- The `redpanda-data` volume was wiped once during that diagnosis. Nothing of value was in it;
+  the Postgres volume was deliberately left untouched.
+
+### GPS producer notes
+
+- **Phase 1 writes bare Avro** (`fastavro.schemaless_writer`), not the Confluent wire format.
+  Phase 2 adds the magic byte and registry schema id once the schema is registered. The
+  `.avsc` file is the contract either way; only the framing changes.
+- **Messages are keyed by `rider_id`** so one rider's pings keep their order within a
+  partition. Sessionization in Phase 3 depends on it; an integration test asserts no rider is
+  ever split across partitions.
+- **`event_ts` is the device time, never the send time.** Chaos scenario 1 will delay delivery
+  well past it, and the Phase 3 watermark depends on the distinction. The Kafka message
+  timestamp is set from `event_ts` explicitly, and a test asserts the two match.
+- **A leg's length is stored on the track, not redrawn per ping.** It used to be redrawn,
+  which made arrival time unrelated to the distance supposedly covered — `trips_started` sat
+  at 0 through a 20s demo. After the fix the same run produced 3 trip rollovers.
+
 ### Integration test conventions
 
 - Fixtures clear **dependent tables first** (`order_items`, `payments`, `orders`), then the
@@ -304,7 +343,7 @@ Each phase ends in something demoable. Never leave the repo in a broken state.
 | Phase | Scope | Status |
 | --- | --- | --- |
 | 0 | Foundation — repo skeleton, core Compose profile, Postgres DDL + logical replication, ADR-0001, runbook | **DONE, verified 2026-09-24** |
-| 1 | Source simulation — OLTP generator (Faker + order state machine), GPS producer, `--chaos` flag | **ACTIVE** — OLTP generator done; GPS producer and chaos remain |
+| 1 | Source simulation — OLTP generator (Faker + order state machine), GPS producer, `--chaos` flag | **ACTIVE** — OLTP generator and GPS producer done; chaos and CLI remain |
 | 2 | CDC ingestion + contracts — Debezium connector, Avro schemas registered `BACKWARD`, Bronze streaming, DLQ, exactly-once | Not started |
 | 3 | Silver — SCD2 via Delta `MERGE`, dedup on `(pk, lsn)`, GPS sessionization, GE gate, `OPTIMIZE`/`ZORDER` | Not started |
 | 4 | Gold — dbt star schema, `dim_date` from Nager.Date, Open-Meteo join, generic + singular tests, docs | Not started |
