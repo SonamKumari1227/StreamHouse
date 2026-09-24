@@ -2,7 +2,9 @@
 # Lets `from generator... import ...` resolve without installing the package.
 pythonpath = ["."]
 testpaths = ["tests"]
-addopts = "-q --strict-markers"
+# Integration tests need the Docker stack, so they are opt-in: `pytest -m integration`.
+# A -m on the command line overrides this one.
+addopts = "-q --strict-markers -m 'not integration'"
 markers = [
     "integration: needs Docker (testcontainers)",
     "chaos: exercises an injected failure scenario",

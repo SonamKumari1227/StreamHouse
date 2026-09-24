@@ -80,12 +80,12 @@ Show each file or group of files after creating it, then wait before continuing.
 
 | | |
 | --- | --- |
-| **Active phase** | **Phase 1 — Source simulation.** `state_machine.py` done and verified. Phase 0 complete and verified 2026-09-24. |
+| **Active phase** | **Phase 1 — Source simulation.** `state_machine.py`, `config.py`, `seed.py` done and verified. Next: `oltp_generator.py`. |
 | Repo root | `E:\streamhouse-project\streamhouse\` |
 | Git | Initialised. Remote `origin` → `https://github.com/SonamKumari1227/StreamHouse.git`, branch `master`. Last commit `c0753c5`. **Everything from item 3 onward is uncommitted** — `docs/decisions/`, `docs/runbook.md`, `infra/docker-compose.yml`, `infra/postgres/`, `Makefile`, `.env.example`, `requirements.txt`, plus edits to `CLAUDE.md`, `README.md`, `docs/README.md`, `docs/architecture.md`. **User handles all staging, commits and pushes manually.** |
 | IDE | PyCharm — `.idea/` present and already gitignored. |
 | Python 3.11 | Installed at `C:\Users\erson\AppData\Local\Programs\Python\Python311\python.exe`. `py` defaults to 3.13 — always invoke `py -3.11` explicitly. |
-| venv | Created at `.venv` (Python 3.11.9). **Only pytest, pytest-cov, ruff and mypy are installed** — not the full `requirements.txt`. Install the rest per phase as needed; see the Airflow caveat below. |
+| venv | `.venv` (Python 3.11.9). Deps installed **per phase**, not from `requirements.txt` wholesale — see the Airflow blocker below. |
 | Docker | 27.5.1, Compose v2.32.4. Core stack verified healthy. |
 | GNU Make | 3.81, at `C:\Program Files (x86)\GnuWin32\bin\make.exe`. On the **Windows user PATH** since 2026-09-24, so every newly started process resolves `make` — terminals, PyCharm, PowerShell, Claude Code sessions. Also in `~/.bashrc`. No export prefix needed. |
 
@@ -173,9 +173,12 @@ Make 4.x features in this Makefile without testing them first.
 - [x] `generator/__init__.py`
 - [x] `generator/state_machine.py` — pure transition logic, no I/O
 - [x] `tests/unit/test_state_machine.py` — 34 tests
-- [x] `pyproject.toml` — pytest `pythonpath`, ruff (line 100, py311), mypy strict
-- [ ] `generator/config.py` — cities, cuisines, volume knobs
-- [ ] `generator/seed.py` — reference data, idempotent
+- [x] `pyproject.toml` — pytest `pythonpath`, markers, ruff (line 100, py311), mypy strict
+- [x] `generator/config.py` — cities, cuisines, dishes, enums, volume knobs, `LoadConfig`
+- [x] `tests/unit/test_config.py` — 41 tests, incl. DDL CHECK-constraint parity
+- [x] `generator/seed.py` — reference data builders + idempotent writer
+- [x] `tests/unit/test_seed.py` — 33 tests against a fake cursor
+- [x] `tests/integration/test_seed_idempotency.py` — 8 tests against real Postgres
 - [ ] `generator/oltp_generator.py` — the daemon; owns all SQL
 - [ ] `generator/gps_producer.py` — Avro pings to Redpanda
 - [ ] `generator/chaos.py` — named composable scenarios
@@ -185,11 +188,25 @@ Make 4.x features in this Makefile without testing them first.
 
 ```
 ruff check           : All checks passed!
-ruff format --check  : 3 files already formatted
-mypy (strict)        : Success: no issues found in 3 source files
-pytest               : 34 passed in 0.38s
-coverage             : generator/state_machine.py  143 stmts, 0 miss, 100%
+ruff format --check  : 8 files already formatted
+mypy (strict)        : Success: no issues found in 8 source files
+pytest               : 108 passed, 8 deselected in 1.60s
+pytest -m integration: 8 passed, 108 deselected in 2.59s   (real Postgres)
+coverage             : generator/  373 stmts, 0 miss, 100%
 ```
+
+The dev database was left untouched — the integration fixture rolls its transaction back,
+confirmed by all four reference tables reading 0 afterwards.
+
+**Test layout.** `pytest` runs unit tests only; `addopts` carries `-m 'not integration'`.
+Run `pytest -m integration` for the Postgres round trip, which needs `make up` first and
+skips cleanly if the database is unreachable.
+
+**Two things worth knowing about the integration tests:**
+- They wrap everything in a transaction and roll it back, so the dev stack is left as found.
+- `setval` is **not** transactional in PostgreSQL, so sequence values survive that rollback.
+  Harmless — the sequence simply points past ids that no longer exist — but do not be
+  surprised by it.
 
 Decisions settled by the user for Phase 1:
 
@@ -209,12 +226,20 @@ State machine design, for anyone extending it:
 - It is the **only** writer of `status` and the `*_ts` columns. Chaos wraps it from outside, never
   reaches in — that is what makes a bad row attributable to a named scenario instead of a bug.
 
-### Known caveat — full requirements.txt has not been installed
+### KNOWN BLOCKER — Airflow cannot be installed on native Windows (Phase 5)
 
-Only the test/lint toolchain is in `.venv`. `pip install -r requirements.txt` has **not** been run,
-and `apache-airflow==3.0.1` is not reliably installable on native Windows — it is expected to be run
-under WSL2 or in a container. Resolve this before Phase 5, not now. Phase 1 needs only `faker`,
-`psycopg[binary]`, `confluent-kafka`, `fastavro` and `pydantic`, which install on Windows fine.
+**Deferred deliberately. Do not attempt to solve this before Phase 5.**
+
+`apache-airflow==3.0.1` is not reliably installable on native Windows; it expects a POSIX
+environment. Phase 5 is the first phase that needs it. When that phase starts, the options are
+to run Airflow in a container from the `orchestration` Compose profile (the intended route, and
+what `infra/docker-compose.yml` is already shaped for), or to move development into WSL2 — which
+the repo is scheduled to do before Phase 2 anyway, for the file-I/O reason recorded above.
+
+`.venv` therefore holds only what each phase actually needs, installed incrementally rather than
+via `pip install -r requirements.txt`. Currently installed: `pytest`, `pytest-cov`, `ruff`,
+`mypy`, `faker`, `psycopg[binary]`. Still needed for the rest of Phase 1: `confluent-kafka`,
+`fastavro`, `pydantic` — all of which install on Windows without trouble.
 
 ### Known deviation from spec
 
@@ -232,7 +257,7 @@ Each phase ends in something demoable. Never leave the repo in a broken state.
 | Phase | Scope | Status |
 | --- | --- | --- |
 | 0 | Foundation — repo skeleton, core Compose profile, Postgres DDL + logical replication, ADR-0001, runbook | **DONE, verified 2026-09-24** |
-| 1 | Source simulation — OLTP generator (Faker + order state machine), GPS producer, `--chaos` flag | **ACTIVE** — state machine done |
+| 1 | Source simulation — OLTP generator (Faker + order state machine), GPS producer, `--chaos` flag | **ACTIVE** — state machine, config and seed done |
 | 2 | CDC ingestion + contracts — Debezium connector, Avro schemas registered `BACKWARD`, Bronze streaming, DLQ, exactly-once | Not started |
 | 3 | Silver — SCD2 via Delta `MERGE`, dedup on `(pk, lsn)`, GPS sessionization, GE gate, `OPTIMIZE`/`ZORDER` | Not started |
 | 4 | Gold — dbt star schema, `dim_date` from Nager.Date, Open-Meteo join, generic + singular tests, docs | Not started |
