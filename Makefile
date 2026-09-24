@@ -6,21 +6,23 @@
 # Requires GNU make. On Windows: `winget install GnuWin32.Make`, or run the
 # `docker compose` commands underneath directly — every target is a thin wrapper.
 
+# Mirrors the defaults in docker-compose.yml so targets work before .env is copied.
+# These MUST be defined before PSQL: `:=` expands immediately, so a later definition
+# would expand to empty and psql would read the next flag as the username.
+PG_USER ?= streamhouse
+PG_DB   ?= streamhouse
+
 # --env-file is required: Compose resolves .env relative to the compose file's directory
 # (infra/), not the working directory, so the repo-root .env must be named explicitly.
 COMPOSE := docker compose -f infra/docker-compose.yml --env-file .env
 CORE    := $(COMPOSE) --profile core
 PSQL    := $(CORE) exec -T postgres psql -v ON_ERROR_STOP=1 -U $(PG_USER) -d $(PG_DB)
 
-# Mirrors the defaults in docker-compose.yml so targets work before .env is copied.
-PG_USER ?= streamhouse
-PG_DB   ?= streamhouse
-
 .DEFAULT_GOAL := help
 .PHONY: help up down clean ps logs db-init health
 
 help:  ## Show available targets
-	@echo "StreamHouse — Phase 0"
+	@echo "StreamHouse - Phase 0"
 	@echo ""
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
@@ -51,10 +53,10 @@ logs:  ## Tail logs. Use: make logs S=postgres
 
 # ---------------------------------------------------------------- database
 
+# Piped from the host rather than referenced by container path: Git Bash on Windows rewrites
+# absolute paths like /docker-entrypoint-initdb.d/... into C:/Program Files/Git/...
 db-init:  ## Apply the OLTP schema (idempotent; safe to re-run)
 	@echo "Applying infra/postgres/init/01-schema.sql ..."
-	# Piped from the host rather than referenced by container path: Git Bash on Windows
-	# rewrites absolute paths like /docker-entrypoint-initdb.d/... into C:/Program Files/Git/...
 	@$(PSQL) < infra/postgres/init/01-schema.sql
 	@echo "Done. Tables:"
 	@$(PSQL) -c "\dt"
@@ -94,8 +96,6 @@ health:  ## Verify every core service
 	@echo "=== spark ==="
 	@curl -sf localhost:8090 >/dev/null \
 		&& echo "master UI        : OK" || echo "master UI        : UNREACHABLE"
-	@# A worker container can be "healthy" (its port is open) yet not registered with
-	@# the master. Registration is the property that actually matters.
 	@printf "workers alive    : "; curl -sf localhost:8090/json/ \
 		| grep -o '"aliveworkers" : [0-9]*' | grep -o '[0-9]*$$' || echo "?"
 	@echo ""

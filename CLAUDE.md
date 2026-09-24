@@ -80,13 +80,14 @@ Show each file or group of files after creating it, then wait before continuing.
 
 | | |
 | --- | --- |
-| **Active phase** | **Phase 0 — COMPLETE and VERIFIED on a running stack (2026-09-24).** Phase 1 not started. |
+| **Active phase** | **Phase 1 — Source simulation.** `state_machine.py` done and verified. Phase 0 complete and verified 2026-09-24. |
 | Repo root | `E:\streamhouse-project\streamhouse\` |
 | Git | Initialised. Remote `origin` → `https://github.com/SonamKumari1227/StreamHouse.git`, branch `master`. Last commit `c0753c5`. **Everything from item 3 onward is uncommitted** — `docs/decisions/`, `docs/runbook.md`, `infra/docker-compose.yml`, `infra/postgres/`, `Makefile`, `.env.example`, `requirements.txt`, plus edits to `CLAUDE.md`, `README.md`, `docs/README.md`, `docs/architecture.md`. **User handles all staging, commits and pushes manually.** |
 | IDE | PyCharm — `.idea/` present and already gitignored. |
 | Python 3.11 | Installed at `C:\Users\erson\AppData\Local\Programs\Python\Python311\python.exe`. `py` defaults to 3.13 — always invoke `py -3.11` explicitly. |
-| venv | **Not created — required now for Phase 1.** `py -3.11 -m venv .venv && pip install -r requirements.txt` |
-| Docker | 27.5.1, Compose v2.32.4. Core stack verified healthy. **GNU Make is NOT installed** — run the `docker compose` commands directly, or install it. |
+| venv | Created at `.venv` (Python 3.11.9). **Only pytest, pytest-cov, ruff and mypy are installed** — not the full `requirements.txt`. Install the rest per phase as needed; see the Airflow caveat below. |
+| Docker | 27.5.1, Compose v2.32.4. Core stack verified healthy. |
+| GNU Make | 3.81, at `C:\Program Files (x86)\GnuWin32\bin\make.exe`. On the **Windows user PATH** since 2026-09-24, so every newly started process resolves `make` — terminals, PyCharm, PowerShell, Claude Code sessions. Also in `~/.bashrc`. No export prefix needed. |
 
 ### Phase 0 progress
 
@@ -128,11 +129,19 @@ spark master     : ALIVE, 1 worker registered, 2 cores / 2048 MB
 Schema re-applied a second time to prove idempotency: only `... already exists, skipping` notices,
 no errors.
 
-**Caveat — the Makefile itself has never been executed.** GNU Make is not installed on this machine
-(`make: not on PATH`; not in GnuWin32, Chocolatey, Scoop or Anaconda either). Every verification
-above was run through the underlying `docker compose` commands that each target wraps. The targets
-are therefore unproven as written. Install Make (`winget install GnuWin32.Make`) and run
-`make up && make db-init && make health` to close this gap.
+**The Makefile has now been executed directly.** `make help`, `make ps`, `make db-init` and
+`make health` all run clean; `make health` prints `wal_level : logical` and `workers alive : 1`.
+
+**GNU Make 3.81 is installed at `C:\Program Files (x86)\GnuWin32\bin\make.exe` but is NOT on
+PATH**, so a bare `make` fails with `command not found`. Either add that directory to PATH
+permanently, or prefix the shell session:
+
+```bash
+export PATH="/c/Program Files (x86)/GnuWin32/bin:$PATH"
+```
+
+Make 3.81 is from 2006. It works for every target here, but do not use `.ONESHELL`, `!=` or other
+Make 4.x features in this Makefile without testing them first.
 
 ### Bugs found and fixed during verification
 
@@ -151,6 +160,61 @@ are therefore unproven as written. Install Make (`winget install GnuWin32.Make`)
 5. **Git Bash path mangling.** `psql -f /docker-entrypoint-initdb.d/01-schema.sql` was rewritten by
    MSYS into `C:/Program Files/Git/docker-entrypoint-initdb.d/...`. Fixed: `db-init` now pipes the
    host file into `psql` on stdin, which is also mount-independent.
+6. **Makefile variable-ordering bug.** `PSQL := ... -U $(PG_USER) -d $(PG_DB)` was defined *above*
+   `PG_USER ?=` / `PG_DB ?=`. `:=` expands immediately, so both were empty and psql parsed the next
+   flag as the username: `FATAL: role "-d" does not exist`. Fixed by defining `PG_USER`/`PG_DB`
+   first. Only surfaced by running `make db-init` for real — `docker compose` equivalents hid it.
+7. **Recipe cosmetics.** `#` comment lines inside a recipe are echoed and passed to the shell; moved
+   above the target. GNU Make 3.81 on Windows also mangles non-ASCII in `echo` (the em-dash printed
+   as `â€"`), so recipe output is now ASCII-only.
+
+### Phase 1 progress
+
+- [x] `generator/__init__.py`
+- [x] `generator/state_machine.py` — pure transition logic, no I/O
+- [x] `tests/unit/test_state_machine.py` — 34 tests
+- [x] `pyproject.toml` — pytest `pythonpath`, ruff (line 100, py311), mypy strict
+- [ ] `generator/config.py` — cities, cuisines, volume knobs
+- [ ] `generator/seed.py` — reference data, idempotent
+- [ ] `generator/oltp_generator.py` — the daemon; owns all SQL
+- [ ] `generator/gps_producer.py` — Avro pings to Redpanda
+- [ ] `generator/chaos.py` — named composable scenarios
+- [ ] `generator/__main__.py` — CLI
+
+**Verified 2026-09-24**, actual output:
+
+```
+ruff check           : All checks passed!
+ruff format --check  : 3 files already formatted
+mypy (strict)        : Success: no issues found in 3 source files
+pytest               : 34 passed in 0.38s
+coverage             : generator/state_machine.py  143 stmts, 0 miss, 100%
+```
+
+Decisions settled by the user for Phase 1:
+
+- **`--speed` multiplier, default 20.0.** Compresses every duration so a demo shows a realistic
+  status distribution in ~90s per order instead of ~30 min. `--speed 1` for an honest overnight run.
+  `promised_ts` is scaled too, or the SLA breach rate would be meaningless.
+- **`--chaos` takes named composable scenarios**, e.g. `--chaos duplicates,out-of-order`, so each
+  test in `tests/chaos/` can request exactly its own scenario. Not a boolean flag.
+
+State machine design, for anyone extending it:
+
+- Table-driven via `DEFAULT_RULES`; adding a state means adding a row.
+- Due-time driven (`next_due_at`), not tick-driven, so lifecycles overlap realistically.
+- Transitions stamp at `next_due_at`, **not** at `now` — polling lateness must not leak into data.
+- `apply_transition` rejects a stale transition rather than absorbing it. Do not relax this; it is
+  the same class of bug that corrupts SCD2 in Phase 3.
+- It is the **only** writer of `status` and the `*_ts` columns. Chaos wraps it from outside, never
+  reaches in — that is what makes a bad row attributable to a named scenario instead of a bug.
+
+### Known caveat — full requirements.txt has not been installed
+
+Only the test/lint toolchain is in `.venv`. `pip install -r requirements.txt` has **not** been run,
+and `apache-airflow==3.0.1` is not reliably installable on native Windows — it is expected to be run
+under WSL2 or in a container. Resolve this before Phase 5, not now. Phase 1 needs only `faker`,
+`psycopg[binary]`, `confluent-kafka`, `fastavro` and `pydantic`, which install on Windows fine.
 
 ### Known deviation from spec
 
@@ -168,7 +232,7 @@ Each phase ends in something demoable. Never leave the repo in a broken state.
 | Phase | Scope | Status |
 | --- | --- | --- |
 | 0 | Foundation — repo skeleton, core Compose profile, Postgres DDL + logical replication, ADR-0001, runbook | **DONE, verified 2026-09-24** |
-| 1 | Source simulation — OLTP generator (Faker + order state machine), GPS producer, `--chaos` flag | **ACTIVE** |
+| 1 | Source simulation — OLTP generator (Faker + order state machine), GPS producer, `--chaos` flag | **ACTIVE** — state machine done |
 | 2 | CDC ingestion + contracts — Debezium connector, Avro schemas registered `BACKWARD`, Bronze streaming, DLQ, exactly-once | Not started |
 | 3 | Silver — SCD2 via Delta `MERGE`, dedup on `(pk, lsn)`, GPS sessionization, GE gate, `OPTIMIZE`/`ZORDER` | Not started |
 | 4 | Gold — dbt star schema, `dim_date` from Nager.Date, Open-Meteo join, generic + singular tests, docs | Not started |
