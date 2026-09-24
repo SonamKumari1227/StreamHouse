@@ -80,7 +80,7 @@ Show each file or group of files after creating it, then wait before continuing.
 
 | | |
 | --- | --- |
-| **Active phase** | **Phase 1 — Source simulation.** `state_machine.py`, `config.py`, `seed.py` done and verified. Next: `oltp_generator.py`. |
+| **Active phase** | **Phase 1 — Source simulation.** `state_machine.py`, `config.py`, `seed.py`, `repository.py`, `oltp_generator.py` done and verified against real Postgres. Next: `gps_producer.py`. |
 | Repo root | `E:\streamhouse-project\streamhouse\` |
 | Git | Initialised. Remote `origin` → `https://github.com/SonamKumari1227/StreamHouse.git`, branch `master`. Last commit `c0753c5`. **Everything from item 3 onward is uncommitted** — `docs/decisions/`, `docs/runbook.md`, `infra/docker-compose.yml`, `infra/postgres/`, `Makefile`, `.env.example`, `requirements.txt`, plus edits to `CLAUDE.md`, `README.md`, `docs/README.md`, `docs/architecture.md`. **User handles all staging, commits and pushes manually.** |
 | IDE | PyCharm — `.idea/` present and already gitignored. |
@@ -179,7 +179,10 @@ Make 4.x features in this Makefile without testing them first.
 - [x] `generator/seed.py` — reference data builders + idempotent writer
 - [x] `tests/unit/test_seed.py` — 33 tests against a fake cursor
 - [x] `tests/integration/test_seed_idempotency.py` — 8 tests against real Postgres
-- [ ] `generator/oltp_generator.py` — the daemon; owns all SQL
+- [x] `generator/repository.py` — the storage boundary; owns all SQL
+- [x] `generator/oltp_generator.py` — the daemon: arrivals, transitions, mutations, recovery
+- [x] `tests/unit/test_oltp_generator.py` — 45 tests against a fake repository
+- [x] `tests/integration/test_oltp_generator_writes.py` — 15 tests against real Postgres
 - [ ] `generator/gps_producer.py` — Avro pings to Redpanda
 - [ ] `generator/chaos.py` — named composable scenarios
 - [ ] `generator/__main__.py` — CLI
@@ -188,12 +191,29 @@ Make 4.x features in this Makefile without testing them first.
 
 ```
 ruff check           : All checks passed!
-ruff format --check  : 8 files already formatted
-mypy (strict)        : Success: no issues found in 8 source files
-pytest               : 108 passed, 8 deselected in 1.60s
-pytest -m integration: 8 passed, 108 deselected in 2.59s   (real Postgres)
-coverage             : generator/  373 stmts, 0 miss, 100%
+ruff format --check  : 12 files already formatted
+mypy (strict)        : Success: no issues found in 12 source files
+pytest               : 154 passed, 23 deselected      (unit only)
+pytest -m integration: 23 passed, 154 deselected in 46s (real Postgres)
+full suite           : 177 passed in 58s
+coverage             : generator/  693 stmts, 0 miss, 100%
 ```
+
+**Committed demo run**, not a rolled-back test — real rows in the dev database:
+
+```
+seeded   : 500 customers, 80 restaurants, 570 menu items, 120 riders
+run 1    : placed=249 transitions=152 delivered=0  (25s wall; a lifecycle takes ~90s at 20x)
+run 2    : recovered=245 from run 1, placed=1002 transitions=2811 delivered=756 cancelled=91
+database : orders=1251  order_items=3708  payments=1251
+status   : DELIVERED 60.4% | PICKED_UP 16.7% | ACCEPTED 12.2% | CANCELLED 7.6% | PLACED 3.0%
+mutated  : 31 menu_items, 10 restaurants, 19 riders  (Phase 3 SCD2 material)
+CDC      : 1213 of 1251 orders updated after insert — multiple events per entity
+```
+
+Order 4939 end to end: 3 line items summing to 3975.96 + 35.34 delivery = 4011.30 total,
+timestamps strictly ordered, rider assigned at acceptance, payment CAPTURED, delivered
+before promised_ts.
 
 The dev database was left untouched — the integration fixture rolls its transaction back,
 confirmed by all four reference tables reading 0 afterwards.
@@ -226,6 +246,33 @@ State machine design, for anyone extending it:
 - It is the **only** writer of `status` and the `*_ts` columns. Chaos wraps it from outside, never
   reaches in — that is what makes a bad row attributable to a named scenario instead of a bug.
 
+### Generator design decisions (Phase 1)
+
+- **The scheduler is in memory, not in the database.** There is no `next_due_at` column on
+  `orders` and there must not be: it is generator bookkeeping, not business data, and it would
+  push a meaningless column into the CDC stream. Postgres is write-only in the hot path.
+- **Restart recovery exists because of that choice.** `OltpGenerator.recover()` reloads
+  non-terminal orders and reschedules them with fresh delays. Proven against real data: a
+  second process picked up 245 in-flight orders and drove them to terminal.
+- **Arrivals are a Poisson process**, not fixed spacing. A perfectly regular stream would let
+  Phase 3's watermarking and late-arrival handling pass against a distribution that never
+  occurs in reality.
+- **Arrival rate is independent of in-flight count.** A backlog must not throttle new orders.
+- **Dimension mutations run on simulated time**, every `MUTATION_INTERVAL_S / speed` seconds.
+  A high arrival rate therefore finishes an order budget *before* the first mutation is due —
+  this caused a real test failure. Drive mutation tests with `until=`, not `max_orders=`.
+- **`advance_order` validates the timestamp column against an allowlist** because that name is
+  interpolated into SQL. Everything else is parameterised.
+
+### Integration test conventions
+
+- Fixtures clear **dependent tables first** (`order_items`, `payments`, `orders`), then the
+  reference tables, all inside a transaction that is rolled back.
+- An earlier fixture *skipped* when orders existed. After a committed demo run that turned into
+  eight silently skipped tests — and a skip reads as success. Do not reintroduce that guard.
+- The suite takes ~46s. Most of it is per-statement latency across the Docker/Windows boundary,
+  which is the `E:\` problem already recorded above. Keep order counts small.
+
 ### KNOWN BLOCKER — Airflow cannot be installed on native Windows (Phase 5)
 
 **Deferred deliberately. Do not attempt to solve this before Phase 5.**
@@ -238,8 +285,8 @@ the repo is scheduled to do before Phase 2 anyway, for the file-I/O reason recor
 
 `.venv` therefore holds only what each phase actually needs, installed incrementally rather than
 via `pip install -r requirements.txt`. Currently installed: `pytest`, `pytest-cov`, `ruff`,
-`mypy`, `faker`, `psycopg[binary]`. Still needed for the rest of Phase 1: `confluent-kafka`,
-`fastavro`, `pydantic` — all of which install on Windows without trouble.
+`mypy`, `faker`, `psycopg[binary]`, `pydantic`. Still needed for the rest of Phase 1:
+`confluent-kafka` and `fastavro`, both of which install on Windows without trouble.
 
 ### Known deviation from spec
 
@@ -257,7 +304,7 @@ Each phase ends in something demoable. Never leave the repo in a broken state.
 | Phase | Scope | Status |
 | --- | --- | --- |
 | 0 | Foundation — repo skeleton, core Compose profile, Postgres DDL + logical replication, ADR-0001, runbook | **DONE, verified 2026-09-24** |
-| 1 | Source simulation — OLTP generator (Faker + order state machine), GPS producer, `--chaos` flag | **ACTIVE** — state machine, config and seed done |
+| 1 | Source simulation — OLTP generator (Faker + order state machine), GPS producer, `--chaos` flag | **ACTIVE** — OLTP generator done; GPS producer and chaos remain |
 | 2 | CDC ingestion + contracts — Debezium connector, Avro schemas registered `BACKWARD`, Bronze streaming, DLQ, exactly-once | Not started |
 | 3 | Silver — SCD2 via Delta `MERGE`, dedup on `(pk, lsn)`, GPS sessionization, GE gate, `OPTIMIZE`/`ZORDER` | Not started |
 | 4 | Gold — dbt star schema, `dim_date` from Nager.Date, Open-Meteo join, generic + singular tests, docs | Not started |

@@ -36,6 +36,8 @@ SMALL = SeedVolumes(
 )
 
 SEED_TABLES = ("menu_items", "restaurants", "customers", "riders")
+#: Cleared first because they hold foreign keys into the reference tables. Safe only
+#: because the whole fixture is rolled back — see the module docstring.
 DEPENDENT_TABLES = ("order_items", "payments", "orders")
 
 
@@ -66,17 +68,10 @@ def cursor() -> Iterator[object]:
 
     with conn:
         with conn.cursor() as cur:
-            for table in DEPENDENT_TABLES:
-                cur.execute(f"SELECT count(*) FROM {table}")
-                row = cur.fetchone()
-                assert row is not None
-                if row[0]:
-                    conn.rollback()
-                    pytest.skip(
-                        f"{table} has {row[0]} rows; refusing to clear reference data "
-                        f"they depend on"
-                    )
-            for table in SEED_TABLES:
+            # Dependents first, then the reference tables. An earlier version skipped the
+            # whole file when orders existed, which turned a generator demo run into eight
+            # silently skipped tests — a skip reads as success, so it hid the coverage.
+            for table in (*DEPENDENT_TABLES, *SEED_TABLES):
                 cur.execute(f"DELETE FROM {table}")
             yield cur
         conn.rollback()
