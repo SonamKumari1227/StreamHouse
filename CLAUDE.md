@@ -81,7 +81,7 @@ Show each file or group of files after creating it, then wait before continuing.
 | | |
 | --- | --- |
 | **Active phase** | **Phase 1 — COMPLETE and verified 2026-09-24.** Phase 2 (CDC ingestion + contracts) is next and has not started. |
-| Repo root | `E:\streamhouse-project\streamhouse\` |
+| Repo root | **`/home/sonam/streamhouse` inside WSL2 (Ubuntu 26.04).** This is canonical. The old `E:\streamhouse-project\streamhouse\` copy is stale ? do not work in it. |
 | Git | Initialised. Remote `origin` → `https://github.com/SonamKumari1227/StreamHouse.git`, branch `master`. Last commit `c0753c5`. **Everything from item 3 onward is uncommitted** — `docs/decisions/`, `docs/runbook.md`, `infra/docker-compose.yml`, `infra/postgres/`, `Makefile`, `.env.example`, `requirements.txt`, plus edits to `CLAUDE.md`, `README.md`, `docs/README.md`, `docs/architecture.md`. **User handles all staging, commits and pushes manually.** |
 | IDE | PyCharm — `.idea/` present and already gitignored. |
 | Python 3.11 | Installed at `C:\Users\erson\AppData\Local\Programs\Python\Python311\python.exe`. `py` defaults to 3.13 — always invoke `py -3.11` explicitly. |
@@ -306,6 +306,22 @@ State machine design, for anyone extending it:
   which made arrival time unrelated to the distance supposedly covered — `trips_started` sat
   at 0 through a 20s demo. After the fix the same run produced 3 trip rollovers.
 
+### Phase 2 starting state (reset 2026-09-24)
+
+Verified immediately before Phase 2:
+
+```
+customers 500 | restaurants 80 | menu_items 570 | riders 120
+orders 0 | order_items 0 | payments 0
+out-of-sequence rows : 0   (chaos residue cleared)
+replication slots    : 0   (Debezium creates its own)
+topics               : _connect_configs, _connect_offsets, _connect_status, _schemas
+                       gps.pings DELETED - 9000 stale messages removed, Phase 2 starts at offset 0
+```
+
+Reference data is seeded and deterministic (seed 20260924); no transactional rows exist, so
+Debezium's initial snapshot is small and its first CDC events are the generator's own writes.
+
 ### Chaos and the dedup key (Phase 1)
 
 - **A duplicate is the same WAL record delivered twice, not the same write repeated.**
@@ -359,12 +375,36 @@ via `pip install -r requirements.txt`. Currently installed: `pytest`, `pytest-co
 `mypy`, `faker`, `psycopg[binary]`, `pydantic`. Still needed for the rest of Phase 1:
 `confluent-kafka` and `fastavro`, both of which install on Windows without trouble.
 
-### Known deviation from spec
+### Repo location ? moved into WSL2 on 2026-09-24
 
-The repo lives on `E:\`, a Windows path. Docker Desktop file I/O across the Windows↔WSL2 boundary
-is roughly an order of magnitude slower and will make Spark appear broken in Phases 2–3 when it is
-not. **Decision: stay on `E:\` through Phase 1; move the repo and Docker volumes into WSL2 before
-starting Phase 2.** Do not silently "fix" this by relocating anything.
+The repo lives at `/home/sonam/streamhouse` in the **Ubuntu** WSL2 distro. Work there, not on
+`E:\`. Docker Desktop's WSL2 integration for Ubuntu was already enabled; **no Docker
+reconfiguration was needed**.
+
+**Why, with the measurement rather than the folklore.** The spec (and three earlier notes in
+this file) claimed Docker *volumes* had to be moved into WSL2. That was wrong for this setup:
+`docker volume inspect` showed them already at `/var/lib/docker/volumes/...` inside the
+`docker-desktop` distro, which is what the WSL2 backend does automatically. There was exactly
+one Windows bind mount ? `./postgres/init`, a few KB read once at first boot.
+
+The real cost is **Docker Desktop's port proxy**, measured at 150 TCP connects to :5432:
+
+```
+from WINDOWS : 5.49 ms/connect
+from WSL2    : 0.69 ms/connect      8x
+```
+
+End to end, the full suite went **90.5s on Windows to 49.7s in WSL2** ? same 329 tests.
+
+**Copying the repo across is not enough.** A `tar` copy carried NTFS stat data into
+`.git/index`, and `git status` then reported all 23 tracked text files as modified even
+though `git diff` was empty and the blob hashes were identical (`765c436` == `765c436`).
+Neither `--refresh` nor `--really-refresh` could reconcile it. The fix was to discard the
+copied `.git` and `git clone` natively inside WSL2, which builds a correct index. If this
+repo is ever relocated again, clone it ? do not copy it.
+
+Windows-side `core.autocrlf=true` also means its working tree holds CRLF while the committed
+blobs are LF; a byte copy therefore looks modified on Linux for that reason too.
 
 ---
 
