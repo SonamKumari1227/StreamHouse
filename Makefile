@@ -20,7 +20,7 @@ PSQL    := $(CORE) exec -T postgres psql -v ON_ERROR_STOP=1 -U $(PG_USER) -d $(P
 
 .DEFAULT_GOAL := help
 .PHONY: help up down clean ps logs db-init health connect-topics minio-init \
-	connector-register connector-status spark-smoke
+	connector-register connector-status spark-smoke stream-bronze
 
 help:  ## Show available targets
 	@echo "StreamHouse - Phase 0"
@@ -142,6 +142,14 @@ minio-init:  ## Create the Delta buckets in MinIO (idempotent)
 		done'
 
 # ---------------------------------------------------------------- spark
+
+TABLE ?= orders
+
+stream-bronze:  ## Stream CDC into Bronze Delta. Use: make stream-bronze TABLE=payments ONCE=1
+	@$(CORE) exec -T spark-master /opt/spark/bin/spark-submit \
+		--master spark://spark-master:7077 \
+		/opt/streamhouse/ingestion/bronze_cdc_stream.py \
+		--table $(TABLE) $(if $(ONCE),--once,)
 
 spark-smoke:  ## Prove Delta + S3A + Kafka work before writing a streaming job
 	@$(CORE) exec -T spark-master /opt/spark/bin/spark-submit \

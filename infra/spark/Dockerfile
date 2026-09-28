@@ -10,6 +10,7 @@
 #   Hadoop 3.3.4   -> hadoop-aws MUST be exactly 3.3.4, or S3A fails on NoSuchMethodError
 #   Spark 3.5.3    -> spark-sql-kafka-0-10 and its token provider must match exactly
 #   Delta 3.2.1    -> the release built for Spark 3.5.x
+#   spark-avro     -> not in the base image; from_avro() does not exist without it
 #
 # ON aws-java-sdk-bundle AND THE CLOUD-FREE RULE (CLAUDE.md rule 1):
 # hadoop-aws is the only implementation of s3a://, and it requires the AWS SDK. CLAUDE.md
@@ -39,9 +40,16 @@ RUN set -eux; cd /opt/spark/jars; \
     curl -fsSLO "$MAVEN/org/apache/hadoop/hadoop-aws/${HADOOP_VERSION}/hadoop-aws-${HADOOP_VERSION}.jar"; \
     curl -fsSLO "$MAVEN/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_VERSION}/aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar"; \
     curl -fsSLO "$MAVEN/org/apache/spark/spark-sql-kafka-0-10_${SCALA_BIN}/${SPARK_VERSION}/spark-sql-kafka-0-10_${SCALA_BIN}-${SPARK_VERSION}.jar"; \
+    curl -fsSLO "$MAVEN/org/apache/spark/spark-avro_${SCALA_BIN}/${SPARK_VERSION}/spark-avro_${SCALA_BIN}-${SPARK_VERSION}.jar"; \
     curl -fsSLO "$MAVEN/org/apache/spark/spark-token-provider-kafka-0-10_${SCALA_BIN}/${SPARK_VERSION}/spark-token-provider-kafka-0-10_${SCALA_BIN}-${SPARK_VERSION}.jar"; \
     curl -fsSLO "$MAVEN/org/apache/kafka/kafka-clients/${KAFKA_CLIENTS_VERSION}/kafka-clients-${KAFKA_CLIENTS_VERSION}.jar"; \
     curl -fsSLO "$MAVEN/org/apache/commons/commons-pool2/${COMMONS_POOL2_VERSION}/commons-pool2-${COMMONS_POOL2_VERSION}.jar"
+
+# The delta-spark JAR covers the Scala side, which is all `format("delta")` and SQL need.
+# The Python DeltaTable API - required for MERGE in foreachBatch - lives in the PyPI package.
+# --no-deps because its only dependency is pyspark, which the image already has; letting pip
+# resolve it would install a second, conflicting copy.
+RUN pip install --no-cache-dir --no-deps delta-spark==3.2.1
 
 RUN mkdir -p /opt/spark/conf
 COPY spark-defaults.conf /opt/spark/conf/spark-defaults.conf
