@@ -306,6 +306,31 @@ State machine design, for anyone extending it:
   which made arrival time unrelated to the distance supposedly covered — `trips_started` sat
   at 0 through a 20s demo. After the fix the same run produced 3 trip rollovers.
 
+### OUTSTANDING ? Spark/Delta/S3A smoke test, REQUIRED before bronze_cdc_stream.py
+
+**Do not write `bronze_cdc_stream.py` until this is done.** Deliberately deferred on
+2026-09-28 to get CDC flowing first; it must not get lost.
+
+Spark is the only component in the stack that has never executed anything. The containers come
+up healthy and the master reports a live worker, but no job has ever been submitted, so none
+of the following is known to work:
+
+- the Delta Lake jars resolving against Spark 3.5.3
+- the S3A connector reaching MinIO (endpoint, path-style access, credentials)
+- `spark-sql-kafka` loading, which the streaming job depends on
+
+What the smoke test must do:
+
+1. write a five-row Delta table to `s3a://bronze/_smoke`
+2. read it back and show the rows
+3. show `DESCRIBE HISTORY` for the table, proving the Delta log works, not just Parquet
+4. confirm the `spark-sql-kafka` package loads
+5. put every config fix into persistent configuration (`spark-defaults.conf` or the compose
+   environment), **not** ad-hoc `--conf` flags on one command line
+
+Debugging S3A endpoints and jar versions inside a streaming job, tangled up with Debezium and
+exactly-once semantics, is far more expensive than retiring the risk in isolation first.
+
 ### Phase 2 starting state (reset 2026-09-24)
 
 Verified immediately before Phase 2:

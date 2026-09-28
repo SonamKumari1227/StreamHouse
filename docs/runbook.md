@@ -318,6 +318,101 @@ empty, or Connect is pointed at a new cluster.
 
 ---
 
+## 4.8 Debezium: registering, checking and resetting the connector
+
+### Register
+
+```bash
+make connector-register     # idempotent: creates if absent, updates if present
+make connector-status       # connector and task state
+```
+
+Credentials come from `.env` via `envsubst` and are piped straight into curl, so the password
+is never written to disk and never committed. The definition lives in
+`infra/connectors/orders-postgres.json`.
+
+### What each setting does
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `plugin.name` | `pgoutput` | Built into Postgres 16. `decoderbufs`/`wal2json` need an extension installed. |
+| `slot.name` | `streamhouse_slot` | Fixed, not generated. A random slot per restart would strand the old one, and a stranded slot retains WAL forever - ADR-0001's hazard. |
+| `publication.name` | `streamhouse_pub` | Fixed for the same reason. |
+| `publication.autocreate.mode` | `filtered` | Publishes only the seven included tables. The default, `all_tables`, would publish everything and needs superuser. |
+| `topic.prefix` | `cdc` | Topics become `cdc.public.<table>`. See ADR-0008. |
+| `snapshot.mode` | `initial` | Gives Phase 3's SCD2 dimensions a baseline row per key. Safe here at 1270 reference rows; a trap on large tables. |
+| `decimal.handling.mode` | `precise` | Money as Avro decimal, not float. |
+| `time.precision.mode` | `connect` | Note: `TIMESTAMPTZ` still arrives as an ISO-8601 **string**, not a timestamp type. |
+| `heartbeat.interval.ms` | `10000` | Advances the slot even when the included tables are idle, so WAL is not retained by a quiet database. |
+
+### Verify it is actually working
+
+```bash
+make connector-status        # connector RUNNING, tasks[0] RUNNING
+
+# the slot must exist AND be active
+docker compose -f infra/docker-compose.yml --env-file .env --profile core exec -T postgres \
+  psql -U streamhouse -d streamhouse -c \
+  "SELECT slot_name, plugin, active FROM pg_replication_slots;"
+
+# topics appear once a table has produced at least one change
+docker compose -f infra/docker-compose.yml --env-file .env --profile core exec -T redpanda \
+  rpk topic list
+```
+
+An empty `cdc.public.orders` topic is not a fault when `orders` has no rows - Debezium creates
+the topic on the first change, not at registration.
+
+### Reset it
+
+Full reset, in this order. **Order matters**: drop the connector first, or it recreates the
+slot while you are deleting it.
+
+```bash
+# 1. remove the connector
+curl -X DELETE localhost:8083/connectors/streamhouse-postgres
+
+# 2. drop the replication slot (it is inactive now the connector is gone)
+docker compose -f infra/docker-compose.yml --env-file .env --profile core exec -T postgres \
+  psql -U streamhouse -d streamhouse -c \
+  "SELECT pg_drop_replication_slot('streamhouse_slot');"
+
+# 3. drop the publication
+docker compose -f infra/docker-compose.yml --env-file .env --profile core exec -T postgres \
+  psql -U streamhouse -d streamhouse -c "DROP PUBLICATION IF EXISTS streamhouse_pub;"
+
+# 4. delete the CDC topics and their schema subjects
+docker compose -f infra/docker-compose.yml --env-file .env --profile core exec -T redpanda \
+  rpk topic delete cdc.public.orders cdc.public.order_items cdc.public.payments \
+  cdc.public.customers cdc.public.restaurants cdc.public.menu_items cdc.public.riders \
+  __debezium-heartbeat.cdc
+curl -X DELETE localhost:8081/subjects/cdc.public.orders-value   # repeat per subject
+
+# 5. register again
+make connector-register
+```
+
+**Never drop the slot while the connector is running.** The WAL it was holding is released
+immediately, and any change not yet read is gone - there is no recovery except a re-snapshot.
+
+### Proven working, 2026-09-28
+
+One INSERT and one UPDATE on `orders`, then a DELETE, produced the full lifecycle on
+`cdc.public.orders`:
+
+```
+offset=0  op=c (CREATE)   before.status=None       after.status=PLACED
+offset=1  op=u (UPDATE)   before.status=PLACED     after.status=DELIVERED
+offset=2  op=d (DELETE)   before.status=DELIVERED  after.status=None
+offset=3  op=TOMBSTONE    (null value, key retained for compaction)
+```
+
+The `before` image on the UPDATE is what `REPLICA IDENTITY FULL` buys, and it is the whole
+argument of ADR-0001: query-based CDC would have shown neither the intermediate `PLACED` state
+nor the delete.
+
+---
+
 ## 5. Teardown
 
 | Command | What it does | Data |
