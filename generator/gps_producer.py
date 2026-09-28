@@ -8,11 +8,12 @@ Same split as the rest of the generator: the geometry and the scheduling are pur
 unit-tested with no broker in sight, and everything that touches Kafka sits behind
 `MessageSink`.
 
-**Encoding.** Phase 1 writes bare Avro via `fastavro.schemaless_writer`. Phase 2 switches to
-the Confluent wire format — a magic byte plus the registry's schema id — once the schema is
-actually registered. The `.avsc` file is the contract either way; only the framing changes.
-Decoding a Phase 1 message therefore needs the schema out of band, which is exactly why the
-registry exists and is worth saying out loud in the ADR.
+**Encoding.** Confluent wire format: a magic byte, the registry's schema id, then the Avro
+payload. Phase 1 wrote bare Avro and Phase 2 switched it, because a bare payload is
+indistinguishable from a corrupt one to any consumer expecting the framing - the first bytes
+of the record get read as the magic byte and id. The schema is registered on startup and the
+returned id cached; registration is idempotent, so restarting the producer does not create a
+new version.
 
 **event_ts is when the device recorded the fix, not when it was produced.** Chaos scenario 1
 will delay delivery long past it. Phase 3's watermark depends on that distinction, so nothing
@@ -33,12 +34,14 @@ from typing import TYPE_CHECKING, Any, Protocol
 from fastavro import parse_schema, schemaless_writer
 
 from generator.config import CITIES, City, LoadConfig, pick_city
+from generator.registry import SchemaRegistry, frame
 from generator.oltp_generator import Clock, RealClock
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
 __all__ = [
+    "GPS_SUBJECT",
     "GPS_TOPIC",
     "GpsPing",
     "GpsProducer",
@@ -52,6 +55,9 @@ __all__ = [
 ]
 
 GPS_TOPIC = "gps.pings"
+
+#: Confluent TopicNameStrategy - the subject a consumer looks for.
+GPS_SUBJECT = "gps.pings-value"
 
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "contracts" / "gps_ping.v1.avsc"
 
@@ -114,10 +120,17 @@ class GpsPing:
         }
 
 
-def encode_ping(ping: GpsPing, schema: Any) -> bytes:
+def encode_ping(ping: GpsPing, schema: Any, schema_id: int | None = None) -> bytes:
+    """Avro-encode a ping, framed for the registry when a schema id is supplied.
+
+    `schema_id=None` yields bare Avro. That was the Phase 1 behaviour and survives only so
+    geometry tests can round-trip a payload with no registry running; nothing that reaches
+    Kafka should use it.
+    """
     buffer = BytesIO()
     schemaless_writer(buffer, schema, ping.as_record())
-    return buffer.getvalue()
+    payload = buffer.getvalue()
+    return payload if schema_id is None else frame(schema_id, payload)
 
 
 def _bearing(from_lat: float, from_lon: float, to_lat: float, to_lon: float) -> float:
@@ -296,6 +309,8 @@ class GpsProducer:
         clock: Clock | None = None,
         topic: str = GPS_TOPIC,
         cities: tuple[City, ...] = CITIES,
+        registry: SchemaRegistry | None = None,
+        schema_id: int | None = None,
     ) -> None:
         if not rider_ids:
             raise ValueError("no riders to track; run the seeder first")
@@ -307,6 +322,17 @@ class GpsProducer:
         self.topic = topic
         self.schema = load_schema()
         self.report = GpsReport()
+
+        # Pin compatibility BEFORE registering, so version 1 is a contract rather than a
+        # description written afterwards - the same order used for the CDC subjects.
+        # An explicit schema_id skips the registry entirely, which is what the unit tests use.
+        if schema_id is not None:
+            self.schema_id = schema_id
+        elif registry is not None:
+            registry.set_compatibility(GPS_SUBJECT, "BACKWARD")
+            self.schema_id = registry.register(GPS_SUBJECT, json.loads(SCHEMA_PATH.read_text()))
+        else:
+            self.schema_id = None
 
         self.tracks = tuple(
             RiderTrack(rider_id, pick_city(self.rng, cities), self.rng) for rider_id in rider_ids
@@ -338,7 +364,7 @@ class GpsProducer:
             if ping.trip_id not in self._seen_trips:
                 self._seen_trips.add(ping.trip_id)
                 self.report.trips_started += 1
-            payload = encode_ping(ping, self.schema)
+            payload = encode_ping(ping, self.schema, self.schema_id)
             self.sink.send(
                 topic=self.topic,
                 # Keyed by rider so one rider's pings keep their order within a partition.

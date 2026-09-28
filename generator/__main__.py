@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 from generator.chaos import IMPLEMENTED, ChaosConfig, ChaosScenario, parse_scenarios
 from generator.config import DEFAULT_RNG_SEED, LoadConfig, SeedVolumes
 from generator.gps_producer import GPS_TOPIC, GpsProducer, KafkaSink
+from generator.registry import SchemaRegistry
 from generator.oltp_generator import OltpGenerator, RealClock
 from generator.repository import PostgresRepository
 from generator.seed import build_reference_data, seed_database
@@ -123,6 +124,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bootstrap", default=DEFAULT_BOOTSTRAP, help="Redpanda bootstrap servers")
     parser.add_argument("--topic", default=GPS_TOPIC, help=f"GPS topic (default: {GPS_TOPIC})")
     parser.add_argument(
+        "--registry", default="http://localhost:8081", help="schema registry URL"
+    )
+    parser.add_argument(
         "--reset",
         action="store_true",
         help="DELETE every row before seeding. Destructive; seed mode only.",
@@ -216,6 +220,7 @@ def run_gps(args: argparse.Namespace, stopper: Stopper) -> int:
         rng=random.Random(args.seed),
         clock=RealClock(),
         topic=args.topic,
+        registry=SchemaRegistry(args.registry),
     )
     report = producer.run(until=_deadline(args.duration or 60.0))
 
