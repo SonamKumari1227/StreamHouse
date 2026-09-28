@@ -122,7 +122,11 @@ services:
     ports:
       - "${SH_CONNECT_PORT:-8083}:8083"
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8083/ >/dev/null || exit 1"]
+      # /connectors, NOT / - the bare root is served by the REST layer alone and answers 200
+      # even when the herder thread is dead, so a broken Connect reported "healthy" through
+      # 39 restart loops. /connectors has to reach the herder, so it fails when Connect is
+      # actually unable to do any work.
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors >/dev/null || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 10
