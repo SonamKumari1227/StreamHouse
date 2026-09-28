@@ -19,7 +19,8 @@ CORE    := $(COMPOSE) --profile core
 PSQL    := $(CORE) exec -T postgres psql -v ON_ERROR_STOP=1 -U $(PG_USER) -d $(PG_DB)
 
 .DEFAULT_GOAL := help
-.PHONY: help up down clean ps logs db-init health connect-topics minio-init
+.PHONY: help up down clean ps logs db-init health connect-topics minio-init \
+	connector-register connector-status
 
 help:  ## Show available targets
 	@echo "StreamHouse - Phase 0"
@@ -92,6 +93,35 @@ db-init:  ## Apply the OLTP schema (idempotent; safe to re-run)
 	@$(PSQL) < infra/postgres/init/01-schema.sql
 	@echo "Done. Tables:"
 	@$(PSQL) -c "\dt"
+
+# ---------------------------------------------------------------- debezium
+
+CONNECTOR_FILE := infra/connectors/orders-postgres.json
+CONNECTOR_NAME := streamhouse-postgres
+
+# Credentials live in .env, never in the committed JSON. The rendered config is piped
+# straight into curl and the response captured in a shell variable, so the password is never
+# written to disk. PUT /connectors/<name>/config creates the connector when absent and
+# updates it when present, which is what makes this idempotent.
+connector-register:  ## Register or update the Debezium connector (idempotent)
+	@test -f .env || (echo "ERROR: .env not found. Run: cp .env.example .env" && exit 1)
+	@set -a; . ./.env; set +a; \
+	resp=$$(envsubst < $(CONNECTOR_FILE) \
+		| python3 -c "import json,sys; print(json.dumps(json.load(sys.stdin)['config']))" \
+		| curl -s -w '\n%{http_code}' -X PUT \
+			-H 'Content-Type: application/json' --data @- \
+			localhost:$${SH_CONNECT_PORT:-8083}/connectors/$(CONNECTOR_NAME)/config); \
+	code=$$(printf '%s' "$$resp" | tail -n1); \
+	if [ "$$code" = "200" ] || [ "$$code" = "201" ]; then \
+		echo "  $(CONNECTOR_NAME): registered/updated (HTTP $$code)"; \
+	else \
+		echo "  FAILED (HTTP $$code):"; printf '%s\n' "$$resp" | sed '$$d'; exit 1; \
+	fi
+
+connector-status:  ## Show the connector and its task state
+	@curl -sf localhost:8083/connectors/$(CONNECTOR_NAME)/status \
+		| python3 -m json.tool 2>/dev/null \
+		|| echo "  $(CONNECTOR_NAME) is not registered (run: make connector-register)"
 
 # ---------------------------------------------------------------- object store
 
