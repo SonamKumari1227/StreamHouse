@@ -81,7 +81,7 @@ Show each file or group of files after creating it, then wait before continuing.
 | | |
 | --- | --- |
 | **Active phase** | **Phase 1 — COMPLETE and verified 2026-09-24.** Phase 2 (CDC ingestion + contracts) is next and has not started. |
-| Repo root | **`/home/sonam/streamhouse` inside WSL2 (Ubuntu 26.04).** This is canonical. The old `E:\streamhouse-project\streamhouse\` copy is stale ? do not work in it. |
+| Repo root | **`/home/sonam/streamhouse` inside WSL2 (Ubuntu 26.04).** This is canonical. The old `E:\streamhouse-project\streamhouse\` copy is stale - do not work in it. |
 | Git | Initialised. Remote `origin` → `https://github.com/SonamKumari1227/StreamHouse.git`, branch `master`. Last commit `c0753c5`. **Everything from item 3 onward is uncommitted** — `docs/decisions/`, `docs/runbook.md`, `infra/docker-compose.yml`, `infra/postgres/`, `Makefile`, `.env.example`, `requirements.txt`, plus edits to `CLAUDE.md`, `README.md`, `docs/README.md`, `docs/architecture.md`. **User handles all staging, commits and pushes manually.** |
 | IDE | PyCharm — `.idea/` present and already gitignored. |
 | Python 3.11 | Installed at `C:\Users\erson\AppData\Local\Programs\Python\Python311\python.exe`. `py` defaults to 3.13 — always invoke `py -3.11` explicitly. |
@@ -306,7 +306,7 @@ State machine design, for anyone extending it:
   which made arrival time unrelated to the distance supposedly covered — `trips_started` sat
   at 0 through a 20s demo. After the fix the same run produced 3 trip rollovers.
 
-### OUTSTANDING ? Spark/Delta/S3A smoke test, REQUIRED before bronze_cdc_stream.py
+### OUTSTANDING - Spark/Delta/S3A smoke test, REQUIRED before bronze_cdc_stream.py
 
 **Do not write `bronze_cdc_stream.py` until this is done.** Deliberately deferred on
 2026-09-28 to get CDC flowing first; it must not get lost.
@@ -400,7 +400,7 @@ via `pip install -r requirements.txt`. Currently installed: `pytest`, `pytest-co
 `mypy`, `faker`, `psycopg[binary]`, `pydantic`. Still needed for the rest of Phase 1:
 `confluent-kafka` and `fastavro`, both of which install on Windows without trouble.
 
-### Repo location ? moved into WSL2 on 2026-09-24
+### Repo location - moved into WSL2 on 2026-09-24
 
 The repo lives at `/home/sonam/streamhouse` in the **Ubuntu** WSL2 distro. Work there, not on
 `E:\`. Docker Desktop's WSL2 integration for Ubuntu was already enabled; **no Docker
@@ -410,7 +410,7 @@ reconfiguration was needed**.
 this file) claimed Docker *volumes* had to be moved into WSL2. That was wrong for this setup:
 `docker volume inspect` showed them already at `/var/lib/docker/volumes/...` inside the
 `docker-desktop` distro, which is what the WSL2 backend does automatically. There was exactly
-one Windows bind mount ? `./postgres/init`, a few KB read once at first boot.
+one Windows bind mount - `./postgres/init`, a few KB read once at first boot.
 
 The real cost is **Docker Desktop's port proxy**, measured at 150 TCP connects to :5432:
 
@@ -419,14 +419,14 @@ from WINDOWS : 5.49 ms/connect
 from WSL2    : 0.69 ms/connect      8x
 ```
 
-End to end, the full suite went **90.5s on Windows to 49.7s in WSL2** ? same 329 tests.
+End to end, the full suite went **90.5s on Windows to 49.7s in WSL2** - same 329 tests.
 
 **Copying the repo across is not enough.** A `tar` copy carried NTFS stat data into
 `.git/index`, and `git status` then reported all 23 tracked text files as modified even
 though `git diff` was empty and the blob hashes were identical (`765c436` == `765c436`).
 Neither `--refresh` nor `--really-refresh` could reconcile it. The fix was to discard the
 copied `.git` and `git clone` natively inside WSL2, which builds a correct index. If this
-repo is ever relocated again, clone it ? do not copy it.
+repo is ever relocated again, clone it - do not copy it.
 
 Windows-side `core.autocrlf=true` also means its working tree holds CRLF while the committed
 blobs are LF; a byte copy therefore looks modified on Linux for that reason too.
