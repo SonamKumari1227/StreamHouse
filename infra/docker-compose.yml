@@ -102,8 +102,13 @@ services:
 
   # ---------------------------------------------------------------- CDC (idle until Phase 2)
   connect:
-    # `2.7` is not a published tag; Debezium publishes X.Y.Z.Final only.
-    image: debezium/connect:2.7.3.Final
+    # Built, not pulled: the stock debezium/connect image has no Avro converter. See
+    # infra/connect/Dockerfile, which also strips Confluent's bundled cloud KMS SDKs.
+    # (`2.7` is not a published Debezium tag; only X.Y.Z.Final exists.)
+    build:
+      context: ./connect
+      dockerfile: Dockerfile
+    image: streamhouse/connect:2.7.3.Final-avro
     container_name: sh-connect
     profiles: ["core"]
     depends_on:
