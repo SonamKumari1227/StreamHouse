@@ -250,6 +250,74 @@ again — named volumes survive, so your data is intact.
 
 ---
 
+## 4.7 Kafka Connect will not start: `cleanup.policy=delete`
+
+**Happened 2026-09-28.** Recorded because the failure is silent, the cause is non-obvious,
+and anything that wipes the Redpanda volume will reproduce it.
+
+**Symptom.** `sh-connect` never becomes healthy and its restart count climbs without bound
+(it reached **39**). `make health` prints `connectors : UNREACHABLE`. The REST port answers,
+so the container does not look dead.
+
+**Root cause.** Connect keeps its worker state in three internal topics and refuses to run
+unless every one of them is log-compacted:
+
+```
+ConfigException: Topic '_connect_offsets' supplied via the 'offset.storage.topic' property
+is required to have 'cleanup.policy=compact' to guarantee consistency and durability of
+source connector offsets, but found the topic currently has 'cleanup.policy=delete'.
+```
+
+The herder thread throws, Connect stops, the container exits and restarts, forever. The
+topics had been auto-created by the **broker** after the `redpanda-data` volume was wiped
+during the librdkafka diagnosis, and broker auto-creation defaults to `cleanup.policy=delete`.
+Connect creates them correctly when it gets there first; it did not.
+
+**Actual state when found** (correcting an earlier note that called them empty):
+
+| Topic | cleanup.policy | Records |
+| --- | --- | --- |
+| `_connect_configs` | `delete` | **4** - auto-generated `session-key` entries, one per hour |
+| `_connect_offsets` | `delete` | 0 |
+| `_connect_status` | `delete` | 0 |
+
+The four records were Connect's own rotating HMAC session keys, not connector configuration -
+no connector had ever been registered. They are disposable, and `alter-config` is
+metadata-only, so nothing had to be deleted.
+
+**Fix**
+
+```bash
+make connect-topics          # idempotent: creates them compacted, or alters them if wrong
+docker compose -f infra/docker-compose.yml --env-file .env --profile core restart connect
+```
+
+`make up` now runs `connect-topics` between starting Redpanda and starting everything else,
+so the ordering cannot be got wrong by accident. Running it by hand is only needed after a
+volume wipe or when recovering an already-broken stack.
+
+**Verify**
+
+```bash
+docker inspect -f '{{.State.Health.Status}} {{.RestartCount}}' sh-connect   # healthy 0
+curl -sf localhost:8083/connectors                                          # []
+```
+
+**Why the healthcheck did not catch it.** It probed `/`, which the REST layer answers by
+itself. It now probes `/connectors`, which has to reach the herder.
+
+Be precise about what that change buys, though: in *this* failure the process exits, so the
+container restarts and its health resets to `starting` every time - it never reported
+`healthy`, and it never reached `unhealthy` either, because each crash begins a fresh 60s
+`start_period`. The old check was not lying so much as saying nothing useful. The new check
+covers the case the old one genuinely would have missed: a herder that is broken or stuck
+while the process stays alive, where `/` keeps answering 200 indefinitely.
+
+**Watch for this whenever** the `redpanda-data` volume is removed, the stack is rebuilt from
+empty, or Connect is pointed at a new cluster.
+
+---
+
 ## 5. Teardown
 
 | Command | What it does | Data |
