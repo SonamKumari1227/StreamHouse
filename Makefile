@@ -19,7 +19,7 @@ CORE    := $(COMPOSE) --profile core
 PSQL    := $(CORE) exec -T postgres psql -v ON_ERROR_STOP=1 -U $(PG_USER) -d $(PG_DB)
 
 .DEFAULT_GOAL := help
-.PHONY: help up down clean ps logs db-init health
+.PHONY: help up down clean ps logs db-init health connect-topics
 
 help:  ## Show available targets
 	@echo "StreamHouse - Phase 0"
@@ -31,6 +31,10 @@ help:  ## Show available targets
 
 up:  ## Start the core stack (postgres, redpanda, console, connect, minio, spark)
 	@test -f .env || (echo "ERROR: .env not found. Run: cp .env.example .env" && exit 1)
+	@# Redpanda first, then fix its internal topics, THEN everything else. Connect dies on
+	@# startup if those topics are not log-compacted, so the ordering is not optional.
+	$(CORE) up -d redpanda
+	@$(MAKE) --no-print-directory connect-topics
 	$(CORE) up -d
 	@echo ""
 	@echo "Starting. Watch readiness with:  make ps"
@@ -50,6 +54,34 @@ ps:  ## Show service status
 
 logs:  ## Tail logs. Use: make logs S=postgres
 	$(CORE) logs -f --tail=100 $(S)
+
+# ---------------------------------------------------------------- kafka connect
+
+# Connect keeps its worker state in these three topics and REFUSES to start unless every one
+# of them is log-compacted - the herder thread dies with a ConfigException and the REST port
+# stays up, so the container looks alive while doing nothing. Broker auto-creation gives them
+# cleanup.policy=delete, which is why this has to run before Connect does.
+CONNECT_TOPICS := _connect_configs _connect_offsets _connect_status
+
+connect-topics:  ## Ensure Connect internal topics exist and are compacted (idempotent)
+	@$(CORE) exec -T redpanda sh -c 'for i in $$(seq 1 30); do \
+		rpk cluster health 2>/dev/null | grep -q "Healthy:.*true" && exit 0; sleep 2; \
+	done; echo "redpanda did not become healthy" >&2; exit 1'
+	@for t in $(CONNECT_TOPICS); do \
+		pol=$$($(CORE) exec -T redpanda rpk topic describe $$t -c 2>/dev/null \
+			| awk '/^cleanup.policy/{print $$2}'); \
+		if [ -z "$$pol" ]; then \
+			$(CORE) exec -T redpanda rpk topic create $$t -p 1 -r 1 \
+				-c cleanup.policy=compact >/dev/null \
+				&& echo "  created  $$t  (cleanup.policy=compact)"; \
+		elif [ "$$pol" != "compact" ]; then \
+			$(CORE) exec -T redpanda rpk topic alter-config $$t \
+				--set cleanup.policy=compact >/dev/null \
+				&& echo "  altered  $$t  ($$pol -> compact)"; \
+		else \
+			echo "  ok       $$t  (cleanup.policy=compact)"; \
+		fi; \
+	done
 
 # ---------------------------------------------------------------- database
 
