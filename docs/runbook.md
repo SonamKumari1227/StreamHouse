@@ -413,6 +413,80 @@ nor the delete.
 
 ---
 
+## 4.9 Bronze CDC stream: load-test results and operating notes
+
+Measured 2026-09-28 against 180 seconds of generator load - 2131 orders, 4116 transitions,
+8384 messages on `cdc.public.orders`.
+
+### Correctness
+
+```
+BRONZE ROWS      : 8383
+DISTINCT (pk,lsn): 8383  ->  duplicates: 0
+```
+
+8384 messages, 1 tombstone skipped, 8383 rows landed. Reconciles exactly, no duplicates.
+
+### Latency - measure it, do not assume it
+
+```
+rows   min_s   p50_s   p95_s
+8383     6.6    19.0    19.4
+```
+
+**p50 is ~19 seconds, not sub-second.** The floor is the fixed cost of a Delta MERGE per
+micro-batch, which the history makes plain:
+
+| version | rows inserted | exec_ms |
+| --- | --- | --- |
+| 1 | 2 | 9378 |
+| 2 | 1 | 8589 |
+| 3 | 8377 | 3119 |
+
+A batch of **8377 rows took less time than a batch of 1**. The cost is per-batch, not
+per-row, so latency is dominated by MERGE overhead and does not improve by sending less data.
+Anyone quoting "sub-minute end-to-end latency" should quote this number instead.
+
+### Resource contention - `spark.cores.max` is mandatory
+
+A continuous streaming query with no cap takes every core in the cluster and never gives them
+back. During the load test:
+
+```
+cores total : 2 | cores used: 2
+ACTIVE : bronze-cdc-orders | cores: 2 | state: RUNNING
+ACTIVE : probe             | cores: 0 | state: WAITING    <- starved indefinitely
+```
+
+`make stream-bronze` now passes `--conf spark.cores.max=1` (override with `STREAM_CORES=`).
+Verified afterwards: a second job ran alongside the stream instead of waiting. **Phase 5's
+Airflow-triggered batch jobs would have starved in exactly this way**, and the symptom - a job
+that simply never starts, with no error - is unpleasant to diagnose.
+
+### Small files
+
+Not yet a problem: each MERGE added a single file, and there are four versions. The risk
+appears with frequent small batches, so revisit when the stream runs continuously under
+steady load rather than in bursts. `OPTIMIZE` and a `VACUUM` retention policy are Phase 3.
+
+### Running it
+
+```bash
+make stream-bronze                    # continuous, orders, 1 core
+make stream-bronze ONCE=1             # drain what is available and stop
+make stream-bronze TABLE=payments     # a different table
+make stream-bronze STREAM_CORES=2     # give it the whole cluster, deliberately
+```
+
+Stopping a detached stream: kill it through the Spark master UI rather than with `pkill`,
+which leaves the application registered and its cores allocated:
+
+```bash
+curl -sf "localhost:8090/app/kill/?id=<app-id>&terminate=true"
+```
+
+---
+
 ## 5. Teardown
 
 | Command | What it does | Data |

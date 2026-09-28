@@ -145,9 +145,17 @@ minio-init:  ## Create the Delta buckets in MinIO (idempotent)
 
 TABLE ?= orders
 
+# spark.cores.max is a job policy, not a cluster policy, so it lives here rather than in
+# spark-defaults.conf. A continuous streaming query with no cap takes every core the cluster
+# has and holds them forever: during the load test it occupied both, and a second job sat in
+# WAITING with 0 cores indefinitely. Phase 5's Airflow-triggered batch jobs would have
+# starved exactly the same way.
+STREAM_CORES ?= 1
+
 stream-bronze:  ## Stream CDC into Bronze Delta. Use: make stream-bronze TABLE=payments ONCE=1
 	@$(CORE) exec -T spark-master /opt/spark/bin/spark-submit \
 		--master spark://spark-master:7077 \
+		--conf spark.cores.max=$(STREAM_CORES) \
 		/opt/streamhouse/ingestion/bronze_cdc_stream.py \
 		--table $(TABLE) $(if $(ONCE),--once,)
 
