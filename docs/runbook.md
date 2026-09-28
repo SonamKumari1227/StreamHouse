@@ -487,6 +487,80 @@ curl -sf "localhost:8090/app/kill/?id=<app-id>&terminate=true"
 
 ---
 
+## 4.10 Schema evolution: what the registry accepts, and the DDL trap
+
+Chaos scenario 4, exercised end to end on 2026-09-28 against the live registry.
+
+### What the gate does
+
+| Change | Verdict |
+| --- | --- |
+| Add a nullable column (optional field, default null) | **accepted** - registered as a new version, connector keeps running |
+| Add a required field with no default | refused, `is_compatible: false` |
+| Change a field's type (`status` string -> int) | refused, and registering it returns **HTTP 409** |
+| Remove an optional field | **accepted** - a reader ignores what it lacks |
+
+`contracts/orders.v2.avsc` is committed specifically to be rejected: it is v1 with
+`status` changed from string to int. `tests/chaos/test_schema_evolution.py` asserts the
+registry refuses it, and that a rejected schema does not appear in the subject's versions.
+
+### Proven against the real pipeline
+
+A breaking DDL change (`ALTER COLUMN promo_code TYPE INTEGER`) made the connector **fail
+loudly** rather than corrupt Bronze:
+
+```
+connector: RUNNING | task: FAILED
+Caused by: ConfigException: Failed to access Avro data from topic cdc.public.orders :
+  Schema being registered is incompatible with an earlier schema ...
+  errorType:'MISSING_UNION_BRANCH' ... compatibility: 'BACKWARD'; error code: 409
+```
+
+Bronze was checked afterwards: 8384 rows, 8384 distinct. Nothing malformed got in.
+
+### THE TRAP: a dropped column leaves a stale registered version
+
+This cost the most time, and the obvious diagnosis is wrong.
+
+After `ALTER TABLE orders DROP COLUMN promo_code`, the connector **stayed failed** even though
+the database was back to its original 17 columns. The reason is not that "dropping a column
+breaks compatibility" - it does not, and there is a test asserting so. The reason is:
+
+1. version 2 in the registry still described `promo_code`
+2. BACKWARD compatibility is checked against the **latest** version
+3. Debezium's 17-field schema was therefore checked against an 18-field v2 and refused
+
+Worse, Debezium's **cached table schema also went stale**: after a task restart it registered
+a *new* version that still contained `promo_code`, describing a column that no longer existed.
+A task restart is not enough - the connector must be restarted for Debezium to re-read the
+table.
+
+### Recovery from a stale schema
+
+```bash
+# 1. which versions exist, and do they match the table?
+curl -sf localhost:8081/subjects/cdc.public.orders-value/versions
+docker compose -f infra/docker-compose.yml --env-file .env --profile core exec -T postgres \
+  psql -U streamhouse -d streamhouse -tAc \
+  "SELECT count(*) FROM information_schema.columns WHERE table_name='orders';"
+
+# 2. soft-delete versions describing columns that no longer exist
+curl -X DELETE localhost:8081/subjects/cdc.public.orders-value/versions/<n>
+
+# 3. restart the CONNECTOR, not just the task - only that re-reads the table schema
+curl -X POST "localhost:8083/connectors/streamhouse-postgres/restart?includeTasks=true"
+
+# 4. force a change and confirm the field count matches the table
+```
+
+Verified recovery: versions back to `[1]`, 17 fields, no `promo_code`, task RUNNING, and the
+registered schema byte-identical to `contracts/orders.v1.avsc`.
+
+**Before dropping a column in a later phase:** plan it. Drop the column, delete the versions
+that describe it, restart the connector, and re-capture the contract - in that order.
+
+---
+
 ## 5. Teardown
 
 | Command | What it does | Data |
