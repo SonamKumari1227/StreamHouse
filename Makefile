@@ -20,7 +20,7 @@ PSQL    := $(CORE) exec -T postgres psql -v ON_ERROR_STOP=1 -U $(PG_USER) -d $(P
 
 .DEFAULT_GOAL := help
 .PHONY: help up down clean ps logs db-init health connect-topics minio-init \
-	connector-register connector-status
+	connector-register connector-status spark-smoke
 
 help:  ## Show available targets
 	@echo "StreamHouse - Phase 0"
@@ -140,6 +140,13 @@ minio-init:  ## Create the Delta buckets in MinIO (idempotent)
 				mc mb "local/$$b" >/dev/null 2>&1 && echo "  created  $$b"; \
 			fi; \
 		done'
+
+# ---------------------------------------------------------------- spark
+
+spark-smoke:  ## Prove Delta + S3A + Kafka work before writing a streaming job
+	@$(CORE) exec -T spark-master /opt/spark/bin/spark-submit \
+		--master spark://spark-master:7077 \
+		/opt/streamhouse/ingestion/smoke_test.py
 
 # ---------------------------------------------------------------- verification
 

@@ -163,9 +163,22 @@ services:
 
   # ---------------------------------------------------------------- compute (idle until Phase 2)
   spark-master:
-    image: apache/spark:3.5.3
+    # Built, not pulled: the stock image has no Delta, no S3A and no Kafka jars.
+    # See infra/spark/Dockerfile.
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    image: streamhouse/spark:3.5.3-delta
     container_name: sh-spark-master
     profiles: ["core"]
+    environment:
+      # S3A reads these via EnvironmentVariableCredentialsProvider; they are never written
+      # into the committed spark-defaults.conf.
+      AWS_ACCESS_KEY_ID: ${SH_MINIO_ROOT_USER:-streamhouse}
+      AWS_SECRET_ACCESS_KEY: ${SH_MINIO_ROOT_PASSWORD:?set SH_MINIO_ROOT_PASSWORD in .env}
+    volumes:
+      # Read-only: Spark runs the code, it does not own it.
+      - ../:/opt/streamhouse:ro
     command:
       - /opt/spark/bin/spark-class
       - org.apache.spark.deploy.master.Master
@@ -183,9 +196,14 @@ services:
     restart: unless-stopped
 
   spark-worker:
-    image: apache/spark:3.5.3
+    image: streamhouse/spark:3.5.3-delta
     container_name: sh-spark-worker
     profiles: ["core"]
+    environment:
+      AWS_ACCESS_KEY_ID: ${SH_MINIO_ROOT_USER:-streamhouse}
+      AWS_SECRET_ACCESS_KEY: ${SH_MINIO_ROOT_PASSWORD:?set SH_MINIO_ROOT_PASSWORD in .env}
+    volumes:
+      - ../:/opt/streamhouse:ro
     depends_on:
       spark-master:
         condition: service_healthy
