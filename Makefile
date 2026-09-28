@@ -19,7 +19,7 @@ CORE    := $(COMPOSE) --profile core
 PSQL    := $(CORE) exec -T postgres psql -v ON_ERROR_STOP=1 -U $(PG_USER) -d $(PG_DB)
 
 .DEFAULT_GOAL := help
-.PHONY: help up down clean ps logs db-init health connect-topics
+.PHONY: help up down clean ps logs db-init health connect-topics minio-init
 
 help:  ## Show available targets
 	@echo "StreamHouse - Phase 0"
@@ -92,6 +92,24 @@ db-init:  ## Apply the OLTP schema (idempotent; safe to re-run)
 	@$(PSQL) < infra/postgres/init/01-schema.sql
 	@echo "Done. Tables:"
 	@$(PSQL) -c "\dt"
+
+# ---------------------------------------------------------------- object store
+
+# The medallion layout, plus the two paths the pipeline needs that are not layers:
+# quarantine for rows a quality gate rejects, checkpoints for Spark's exactly-once state.
+MINIO_BUCKETS := bronze silver gold quarantine checkpoints
+
+minio-init:  ## Create the Delta buckets in MinIO (idempotent)
+	@$(CORE) exec -T minio sh -c '\
+		mc alias set local http://localhost:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" \
+			>/dev/null 2>&1; \
+		for b in $(MINIO_BUCKETS); do \
+			if mc ls "local/$$b" >/dev/null 2>&1; then \
+				echo "  ok       $$b"; \
+			else \
+				mc mb "local/$$b" >/dev/null 2>&1 && echo "  created  $$b"; \
+			fi; \
+		done'
 
 # ---------------------------------------------------------------- verification
 
