@@ -28,7 +28,7 @@ import json
 import sys
 import urllib.request
 
-from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.avro.functions import from_avro
 
@@ -43,13 +43,45 @@ CHECKPOINTS = "s3a://checkpoints"
 WIRE_HEADER_BYTES = 5
 
 
-def fetch_schema(subject):
-    url = "{0}/subjects/{1}/versions/latest".format(REGISTRY_URL, subject)
+def fetch_schema(subject: str) -> str:
+    url = f"{REGISTRY_URL}/subjects/{subject}/versions/latest"
     with urllib.request.urlopen(url, timeout=10) as response:
-        return json.load(response)["schema"]
+        schema: str = json.load(response)["schema"]
+    return schema
 
 
-def write_batch(batch_df, batch_id, target, quarantine_path, spark):
+def to_bronze_pings(decoded: DataFrame) -> DataFrame:
+    """Flatten decoded pings to the Bronze shape.
+
+    Split out of write_batch so it can be asserted on directly: it is the only part of this
+    job that is a pure function of its input, and the only part worth a unit test.
+    """
+    return decoded.filter(F.col("ping").isNotNull()).select(
+        F.col("ping.rider_id").cast("long").alias("rider_id"),
+        F.col("ping.trip_id").alias("trip_id"),
+        F.col("ping.lat").alias("lat"),
+        F.col("ping.lon").alias("lon"),
+        F.col("ping.speed_kmph").alias("speed_kmph"),
+        F.col("ping.heading_deg").alias("heading_deg"),
+        F.col("ping.accuracy_m").alias("accuracy_m"),
+        # Device time. Phase 3 watermarks on this; it is never the arrival time.
+        (F.col("ping.event_ts") / 1000).cast("timestamp").alias("event_ts"),
+        F.col("topic"),
+        F.col("partition"),
+        F.col("offset"),
+        F.col("timestamp").alias("kafka_ts"),
+        F.current_timestamp().alias("ingest_ts"),
+        F.to_date((F.col("ping.event_ts") / 1000).cast("timestamp")).alias("event_date"),
+    )
+
+
+def write_batch(
+    batch_df: DataFrame,
+    batch_id: int,
+    target: str,
+    quarantine_path: str,
+    spark: SparkSession,
+) -> None:
     from delta.tables import DeltaTable
 
     batch_df.persist()
@@ -65,26 +97,9 @@ def write_batch(batch_df, batch_id, target, quarantine_path, spark):
                 .mode("append")
                 .save(quarantine_path)
             )
-            print("batch {0}: quarantined {1} undecodable ping(s)".format(batch_id, bad_count))
+            print(f"batch {batch_id}: quarantined {bad_count} undecodable ping(s)")
 
-        good = batch_df.filter(F.col("ping").isNotNull()).select(
-            F.col("ping.rider_id").cast("long").alias("rider_id"),
-            F.col("ping.trip_id").alias("trip_id"),
-            F.col("ping.lat").alias("lat"),
-            F.col("ping.lon").alias("lon"),
-            F.col("ping.speed_kmph").alias("speed_kmph"),
-            F.col("ping.heading_deg").alias("heading_deg"),
-            F.col("ping.accuracy_m").alias("accuracy_m"),
-            # Device time. Phase 3 watermarks on this; it is never the arrival time.
-            (F.col("ping.event_ts") / 1000).cast("timestamp").alias("event_ts"),
-            F.col("topic"),
-            F.col("partition"),
-            F.col("offset"),
-            F.col("timestamp").alias("kafka_ts"),
-            F.current_timestamp().alias("ingest_ts"),
-            F.to_date((F.col("ping.event_ts") / 1000).cast("timestamp")).alias("event_date"),
-        )
-        deduped = good.dropDuplicates(["topic", "partition", "offset"])
+        deduped = to_bronze_pings(batch_df).dropDuplicates(["topic", "partition", "offset"])
 
         if DeltaTable.isDeltaTable(spark, target):
             (
@@ -99,16 +114,12 @@ def write_batch(batch_df, batch_id, target, quarantine_path, spark):
             )
         else:
             deduped.write.format("delta").partitionBy("event_date").mode("append").save(target)
-        print(
-            "batch {0}: {1} candidate ping(s) merged into {2}".format(
-                batch_id, deduped.count(), target
-            )
-        )
+        print(f"batch {batch_id}: {deduped.count()} candidate ping(s) merged into {target}")
     finally:
         batch_df.unpersist()
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Stream GPS pings into Bronze Delta.")
     parser.add_argument("--topic", default="gps.pings")
     parser.add_argument("--starting-offsets", default="earliest")
@@ -119,7 +130,7 @@ def main(argv=None):
     spark.sparkContext.setLogLevel("WARN")
 
     schema_json = fetch_schema(SUBJECT)
-    print("decoding {0} against {1}".format(args.topic, SUBJECT))
+    print(f"decoding {args.topic} against {SUBJECT}")
 
     raw = (
         spark.readStream.format("kafka")
@@ -132,20 +143,20 @@ def main(argv=None):
     )
     stripped = raw.withColumn(
         "avro_payload",
-        F.expr("substring(value, {0}, length(value))".format(WIRE_HEADER_BYTES + 1)),
+        F.expr(f"substring(value, {WIRE_HEADER_BYTES + 1}, length(value))"),
     )
     decoded = stripped.withColumn(
         "ping", from_avro(F.col("avro_payload"), schema_json, {"mode": "PERMISSIVE"})
     )
 
-    target = "{0}/raw_gps".format(BRONZE)
-    quarantine_path = "{0}/bronze_gps".format(QUARANTINE)
+    target = f"{BRONZE}/raw_gps"
+    quarantine_path = f"{QUARANTINE}/bronze_gps"
 
     writer = (
         decoded.writeStream.foreachBatch(
             lambda df, bid: write_batch(df, bid, target, quarantine_path, spark)
         )
-        .option("checkpointLocation", "{0}/bronze_gps".format(CHECKPOINTS))
+        .option("checkpointLocation", f"{CHECKPOINTS}/bronze_gps")
         .queryName("bronze-gps")
     )
     if args.once:

@@ -55,8 +55,9 @@ def main() -> int:
         failures.append("DESCRIBE HISTORY returned no versions - not a Delta table")
 
     print("\n=== 5. second write -> the log must gain a version ===")
-    spark.createDataFrame([(6, "row-6", 9.0)], "id INT, label STRING, value DOUBLE") \
-        .write.format("delta").mode("append").save(TABLE)
+    spark.createDataFrame([(6, "row-6", 9.0)], "id INT, label STRING, value DOUBLE").write.format(
+        "delta"
+    ).mode("append").save(TABLE)
     v2 = [r.version for r in spark.sql(f"DESCRIBE HISTORY delta.`{TABLE}`").collect()]
     print(f"versions now: {v2}  (rows: {spark.read.format('delta').load(TABLE).count()})")
     if len(v2) <= len(versions):
@@ -80,7 +81,7 @@ def main() -> int:
         kdf = reader.load()
         print(f"kafka source loaded; schema: {[f.name for f in kdf.schema.fields]}")
         print(f"messages readable on cdc.public.orders: {kdf.count()}")
-    except Exception as exc:  # noqa: BLE001 - the point is to report, not to crash
+    except Exception as exc:
         failures.append(f"spark-sql-kafka failed: {type(exc).__name__}: {exc}")
         print(f"FAILED: {exc}")
 

@@ -14,18 +14,23 @@ How to run StreamHouse locally, verify it is healthy, and fix it when it is not.
 
 ## Status — what actually works today
 
-Phase 0 is in progress. This section is the honest inventory; update it as items land.
+Phases 0–2 are complete. This section is the honest inventory; update it as items land.
 
 | Capability | State |
 | --- | --- |
 | Repo skeleton, docs, ADRs | ✅ Done |
-| `infra/docker-compose.yml` (core profile) | ⬜ Phase 0, item 4 |
-| Postgres DDL + logical replication | ⬜ Phase 0, item 5 |
-| `Makefile`, `.env.example`, `requirements.txt` | ⬜ Phase 0, item 6 |
-| Everything from Phase 1 onward | ⬜ Not started |
+| `infra/docker-compose.yml` (core profile) | ✅ Done — 7 services, all healthy |
+| Postgres DDL + logical replication | ✅ Done — `wal_level=logical`, 7 tables |
+| `Makefile`, `.env.example`, `requirements.txt` | ✅ Done |
+| Source simulation — OLTP generator, GPS producer, `--chaos` | ✅ Phase 1, verified 2026-09-24 |
+| Debezium connector + Avro contracts in the registry | ✅ Phase 2 — §4.8 |
+| Bronze CDC stream — Kafka → Delta, idempotent, with a DLQ | ✅ Phase 2 — §4.9 |
+| Bronze GPS stream — append-only, deduped on Kafka coordinates | ✅ Phase 2 |
+| Schema evolution gate | ✅ Phase 2 — §4.10 |
+| Silver (SCD2, sessionization), Gold, Airflow, observability | ⬜ Phase 3 onward, not started |
 
-**Until items 4–6 land, the commands below will not run.** They describe the target state of Phase 0
-and are written first on purpose — the documentation defines what the Makefile has to deliver.
+Verified 2026-10-05: `ruff`, `mypy --strict`, 275 host tests and 12 Spark transform tests all
+green — `make test` and `make test-spark`.
 
 ---
 

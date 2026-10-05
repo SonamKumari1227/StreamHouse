@@ -37,8 +37,12 @@ SCHEMA = load_schema()
 
 
 def decode(payload: bytes) -> dict[str, Any]:
-    """fastavro returns Any; the contract guarantees the shape."""
-    return cast("dict[str, Any]", schemaless_reader(io.BytesIO(payload), SCHEMA))
+    """fastavro returns Any; the contract guarantees the shape.
+
+    reader_schema is passed explicitly: it defaults to None at runtime, but fastavro's stub
+    declares it without a default, so omitting it type-checks as a missing argument.
+    """
+    return cast("dict[str, Any]", schemaless_reader(io.BytesIO(payload), SCHEMA, None))
 
 
 def make_producer(

@@ -20,7 +20,8 @@ PSQL    := $(CORE) exec -T postgres psql -v ON_ERROR_STOP=1 -U $(PG_USER) -d $(P
 
 .DEFAULT_GOAL := help
 .PHONY: help up down clean ps logs db-init health connect-topics minio-init \
-	connector-register connector-status spark-smoke stream-bronze
+	connector-register connector-status spark-smoke stream-bronze stream-gps \
+	test test-spark build
 
 help:  ## Show available targets
 	@echo "StreamHouse - Phase 0"
@@ -159,10 +160,37 @@ stream-bronze:  ## Stream CDC into Bronze Delta. Use: make stream-bronze TABLE=p
 		/opt/streamhouse/ingestion/bronze_cdc_stream.py \
 		--table $(TABLE) $(if $(ONCE),--once,)
 
+stream-gps:  ## Stream GPS pings into Bronze Delta. Use: make stream-gps ONCE=1
+	@$(CORE) exec -T spark-master /opt/spark/bin/spark-submit \
+		--master spark://spark-master:7077 \
+		--conf spark.cores.max=$(STREAM_CORES) \
+		/opt/streamhouse/ingestion/bronze_gps_stream.py \
+		$(if $(ONCE),--once,)
+
 spark-smoke:  ## Prove Delta + S3A + Kafka work before writing a streaming job
 	@$(CORE) exec -T spark-master /opt/spark/bin/spark-submit \
 		--master spark://spark-master:7077 \
 		/opt/streamhouse/ingestion/smoke_test.py
+
+# ---------------------------------------------------------------- tests
+
+build:  ## Rebuild the custom Connect and Spark images
+	$(CORE) build connect spark-master
+
+test:  ## Unit tests on the host (no containers, no JVM)
+	@.venv/bin/python -m pytest
+
+# The DataFrame transforms cannot run on the host: there is no JVM and no pyspark there, by
+# the decision in pyproject.toml. They run inside the Spark image instead, against the exact
+# Spark, Delta and Python the streaming jobs themselves use.
+#
+# -p no:cacheprovider: /opt/streamhouse is the repo bind-mounted from the host and owned by
+# the host user, while this container runs as `spark`. Writing .pytest_cache there fails.
+test-spark:  ## PySpark transform tests, inside the Spark image
+	@$(CORE) exec -T spark-master bash -c 'cd /opt/streamhouse \
+		&& export PYTHONDONTWRITEBYTECODE=1 \
+		&& export PYTHONPATH="/opt/spark/python:$$(ls /opt/spark/python/lib/py4j-*-src.zip)" \
+		&& python3 -m pytest tests/spark -m spark -p no:cacheprovider'
 
 # ---------------------------------------------------------------- verification
 

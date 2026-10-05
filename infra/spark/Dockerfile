@@ -51,6 +51,15 @@ RUN set -eux; cd /opt/spark/jars; \
 # resolve it would install a second, conflicting copy.
 RUN pip install --no-cache-dir --no-deps delta-spark==3.2.1
 
+# Test tooling. The DataFrame transforms under ingestion/ are checked against this Spark, not
+# a mock or a host install: the host venv has no JVM, and a pyspark wheel pinned to match this
+# image would be a second copy to keep in step for no gain. `make test-spark` runs them here.
+#
+# pytest 8.4 requires Python 3.9; this image is on 3.8.10 (ADR-0009), so 8.3.5 is the last
+# release that runs here. chispa gives DataFrame equality assertions - the CLAUDE.md
+# convention - instead of hand-rolled collect() comparisons.
+RUN pip install --no-cache-dir pytest==8.3.5 chispa==0.9.4
+
 RUN mkdir -p /opt/spark/conf
 COPY spark-defaults.conf /opt/spark/conf/spark-defaults.conf
 

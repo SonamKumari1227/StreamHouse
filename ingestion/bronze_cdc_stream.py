@@ -41,7 +41,7 @@ import json
 import sys
 import urllib.request
 
-from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.avro.functions import from_avro
 
@@ -68,23 +68,26 @@ PRIMARY_KEYS = {
 }
 
 
-def fetch_schema(subject):
+def fetch_schema(subject: str) -> str:
     """Latest registered Avro schema for a subject, as a JSON string.
 
     urllib rather than requests: the Spark image ships neither requests nor fastavro, and
     stdlib is one less thing to pin.
     """
-    url = "{0}/subjects/{1}/versions/latest".format(REGISTRY_URL, subject)
+    url = f"{REGISTRY_URL}/subjects/{subject}/versions/latest"
     with urllib.request.urlopen(url, timeout=10) as response:
-        return json.load(response)["schema"]
+        schema: str = json.load(response)["schema"]
+    return schema
 
 
-def build_stream(spark, table, schema_json, starting_offsets):
+def build_stream(
+    spark: SparkSession, table: str, schema_json: str, starting_offsets: str
+) -> DataFrame:
     """Kafka -> decoded CDC rows, with the undecodable ones kept rather than dropped."""
     raw = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
-        .option("subscribe", "cdc.public.{0}".format(table))
+        .option("subscribe", f"cdc.public.{table}")
         .option("startingOffsets", starting_offsets)
         # Bound each batch so a backlog cannot produce one enormous first micro-batch.
         .option("maxOffsetsPerTrigger", 10000)
@@ -93,7 +96,7 @@ def build_stream(spark, table, schema_json, starting_offsets):
     )
 
     stripped = raw.withColumn(
-        "avro_payload", F.expr("substring(value, {0}, length(value))".format(WIRE_HEADER_BYTES + 1))
+        "avro_payload", F.expr(f"substring(value, {WIRE_HEADER_BYTES + 1}, length(value))")
     )
 
     # PERMISSIVE: a row that does not match the schema decodes to null rather than killing
@@ -104,13 +107,11 @@ def build_stream(spark, table, schema_json, starting_offsets):
     return decoded
 
 
-def to_bronze_rows(decoded, table):
+def to_bronze_rows(decoded: DataFrame, table: str) -> DataFrame:
     """Flatten to the Bronze shape: full payload plus the offsets needed to rebuild."""
     pk_col = PRIMARY_KEYS[table]
     # A delete carries its key in `before`; everything else carries it in `after`.
-    pk = F.coalesce(
-        F.col("envelope.after.{0}".format(pk_col)), F.col("envelope.before.{0}".format(pk_col))
-    )
+    pk = F.coalesce(F.col(f"envelope.after.{pk_col}"), F.col(f"envelope.before.{pk_col}"))
     return decoded.select(
         F.lit(table).alias("source_table"),
         pk.cast("long").alias("pk"),
@@ -129,7 +130,7 @@ def to_bronze_rows(decoded, table):
     )
 
 
-def write_batch(batch_df, batch_id, table, spark):
+def write_batch(batch_df: DataFrame, batch_id: int, table: str, spark: SparkSession) -> None:
     """Idempotent write of one micro-batch, plus the quarantine split.
 
     Called by foreachBatch, which is at-least-once: this function must tolerate being handed
@@ -143,7 +144,7 @@ def write_batch(batch_df, batch_id, table, spark):
         # anything is judged undecodable.
         tombstones = batch_df.filter(F.col("value").isNull()).count()
         if tombstones:
-            print("batch {0}: skipped {1} tombstone(s)".format(batch_id, tombstones))
+            print(f"batch {batch_id}: skipped {tombstones} tombstone(s)")
 
         bad = batch_df.filter(F.col("value").isNotNull() & F.col("envelope").isNull())
         bad_count = bad.count()
@@ -154,9 +155,9 @@ def write_batch(batch_df, batch_id, table, spark):
                 .withColumn("reason", F.lit("avro_decode_failed"))
                 .write.format("delta")
                 .mode("append")
-                .save("{0}/bronze_{1}_cdc".format(QUARANTINE, table))
+                .save(f"{QUARANTINE}/bronze_{table}_cdc")
             )
-            print("batch {0}: quarantined {1} undecodable row(s)".format(batch_id, bad_count))
+            print(f"batch {batch_id}: quarantined {bad_count} undecodable row(s)")
 
         good = to_bronze_rows(batch_df.filter(F.col("envelope").isNotNull()), table)
 
@@ -164,7 +165,7 @@ def write_batch(batch_df, batch_id, table, spark):
         # collapse to the latest LSN per key first. Same rule Phase 3's SCD2 needs.
         deduped = good.dropDuplicates(["source_table", "pk", "lsn"])
 
-        target_path = "{0}/raw_{1}_cdc".format(BRONZE, table)
+        target_path = f"{BRONZE}/raw_{table}_cdc"
         if DeltaTable.isDeltaTable(spark, target_path):
             (
                 DeltaTable.forPath(spark, target_path)
@@ -187,16 +188,12 @@ def write_batch(batch_df, batch_id, table, spark):
             )
         # Candidates, not insertions: a replayed batch merges the same rows and inserts
         # none of them. The authoritative count is in the Delta history.
-        print(
-            "batch {0}: {1} candidate row(s) merged into {2}".format(
-                batch_id, deduped.count(), target_path
-            )
-        )
+        print(f"batch {batch_id}: {deduped.count()} candidate row(s) merged into {target_path}")
     finally:
         batch_df.unpersist()
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Stream Debezium CDC into Bronze Delta.")
     parser.add_argument("--table", default="orders", choices=sorted(PRIMARY_KEYS))
     parser.add_argument(
@@ -204,28 +201,24 @@ def main(argv=None):
         default="earliest",
         help="earliest (default) or latest. Ignored once a checkpoint exists.",
     )
-    parser.add_argument(
-        "--once", action="store_true", help="process what is available, then stop"
-    )
+    parser.add_argument("--once", action="store_true", help="process what is available, then stop")
     args = parser.parse_args(argv)
 
     table = args.table
-    subject = "cdc.public.{0}-value".format(table)
+    subject = f"cdc.public.{table}-value"
 
-    spark = SparkSession.builder.appName("bronze-cdc-{0}".format(table)).getOrCreate()
+    spark = SparkSession.builder.appName(f"bronze-cdc-{table}").getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
 
     schema_json = fetch_schema(subject)
-    print("decoding {0} against {1} (schema {2} bytes)".format(table, subject, len(schema_json)))
+    print(f"decoding {table} against {subject} (schema {len(schema_json)} bytes)")
 
     decoded = build_stream(spark, table, schema_json, args.starting_offsets)
 
     writer = (
-        decoded.writeStream.foreachBatch(
-            lambda df, bid: write_batch(df, bid, table, spark)
-        )
-        .option("checkpointLocation", "{0}/bronze_{1}_cdc".format(CHECKPOINTS, table))
-        .queryName("bronze-cdc-{0}".format(table))
+        decoded.writeStream.foreachBatch(lambda df, bid: write_batch(df, bid, table, spark))
+        .option("checkpointLocation", f"{CHECKPOINTS}/bronze_{table}_cdc")
+        .queryName(f"bronze-cdc-{table}")
     )
     if args.once:
         writer = writer.trigger(availableNow=True)

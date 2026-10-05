@@ -3,11 +3,13 @@
 pythonpath = ["."]
 testpaths = ["tests"]
 # Integration tests need the Docker stack, so they are opt-in: `pytest -m integration`.
-# A -m on the command line overrides this one.
-addopts = "-q --strict-markers -m 'not integration'"
+# Spark tests need a JVM, which the host venv has not got, so they are opt-in too and run
+# inside the Spark image: `make test-spark`. A -m on the command line overrides this one.
+addopts = "-q --strict-markers -m 'not integration and not spark'"
 markers = [
     "integration: needs Docker (testcontainers)",
     "chaos: exercises an injected failure scenario",
+    "spark: needs a JVM and PySpark; runs inside the Spark image via `make test-spark`",
 ]
 
 [tool.ruff]
@@ -25,4 +27,14 @@ warn_unreachable = true
 # confluent-kafka ships no py.typed marker, so every symbol from it is Any.
 [[tool.mypy.overrides]]
 module = ["confluent_kafka.*"]
+ignore_missing_imports = true
+
+# PySpark and Delta are deliberately NOT installed in this venv. They live in the Spark image
+# (ADR-0009) and the jobs under ingestion/ run there via spark-submit, never on the host. The
+# alternative - a host JDK plus a 300 MB pyspark wheel pinned to the image's version - buys
+# nothing and would drift from the runtime that actually matters. Their symbols are therefore
+# Any here; correctness of the DataFrame code is proven by `make test-spark`, which runs
+# against the real Spark, not by type-checking a stub.
+[[tool.mypy.overrides]]
+module = ["pyspark.*", "delta.*"]
 ignore_missing_imports = true

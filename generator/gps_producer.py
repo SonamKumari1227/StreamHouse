@@ -34,8 +34,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 from fastavro import parse_schema, schemaless_writer
 
 from generator.config import CITIES, City, LoadConfig, pick_city
-from generator.registry import SchemaRegistry, frame
 from generator.oltp_generator import Clock, RealClock
+from generator.registry import SchemaRegistry, frame
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -326,6 +326,8 @@ class GpsProducer:
         # Pin compatibility BEFORE registering, so version 1 is a contract rather than a
         # description written afterwards - the same order used for the CDC subjects.
         # An explicit schema_id skips the registry entirely, which is what the unit tests use.
+        # None is a legitimate value, not an absence: it selects bare Avro, the Phase 1 framing.
+        self.schema_id: int | None
         if schema_id is not None:
             self.schema_id = schema_id
         elif registry is not None:

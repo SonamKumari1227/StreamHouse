@@ -54,9 +54,7 @@ def unframe(message: bytes) -> tuple[int, bytes]:
         raise ValueError(f"message is {len(message)} bytes, too short to be framed")
     magic, schema_id = struct.unpack(">bI", message[:WIRE_HEADER_BYTES])
     if magic != MAGIC_BYTE:
-        raise ValueError(
-            f"expected magic byte {MAGIC_BYTE}, got {magic} - is this bare Avro?"
-        )
+        raise ValueError(f"expected magic byte {MAGIC_BYTE}, got {magic} - is this bare Avro?")
     return schema_id, message[WIRE_HEADER_BYTES:]
 
 
@@ -85,15 +83,19 @@ class SchemaRegistry:
         retroactively validate version 1, so a schema registered first is never checked
         against anything.
         """
-        return self._request("PUT", f"/config/{subject}", {"compatibility": level})[
+        applied: str = self._request("PUT", f"/config/{subject}", {"compatibility": level})[
             "compatibility"
         ]
+        return applied
 
     def compatibility(self, subject: str) -> str:
         try:
-            return self._request("GET", f"/config/{subject}")["compatibilityLevel"]
+            subject_level: str = self._request("GET", f"/config/{subject}")["compatibilityLevel"]
+            return subject_level
         except urllib.error.HTTPError:
-            return self._request("GET", "/config")["compatibilityLevel"]
+            # No subject-level override is registered, so the global default is what applies.
+            global_level: str = self._request("GET", "/config")["compatibilityLevel"]
+            return global_level
 
     def register(self, subject: str, schema: dict[str, Any]) -> int:
         """Register a schema and return its id. Idempotent: re-registering returns the same id."""
@@ -104,10 +106,16 @@ class SchemaRegistry:
         )
 
     def schema_by_id(self, schema_id: int) -> dict[str, Any]:
-        return json.loads(self._request("GET", f"/schemas/ids/{schema_id}")["schema"])
+        parsed: dict[str, Any] = json.loads(
+            self._request("GET", f"/schemas/ids/{schema_id}")["schema"]
+        )
+        return parsed
 
     def latest(self, subject: str) -> dict[str, Any]:
-        return json.loads(self._request("GET", f"/subjects/{subject}/versions/latest")["schema"])
+        parsed: dict[str, Any] = json.loads(
+            self._request("GET", f"/subjects/{subject}/versions/latest")["schema"]
+        )
+        return parsed
 
     def versions(self, subject: str) -> list[int]:
         return list(self._request("GET", f"/subjects/{subject}/versions"))

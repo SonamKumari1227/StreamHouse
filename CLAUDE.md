@@ -80,14 +80,14 @@ Show each file or group of files after creating it, then wait before continuing.
 
 | | |
 | --- | --- |
-| **Active phase** | **Phase 1 — COMPLETE and verified 2026-09-24.** Phase 2 (CDC ingestion + contracts) is next and has not started. |
+| **Active phase** | **Phase 2 — COMPLETE and verified 2026-10-05.** Phase 3 (Silver: SCD2, dedup, sessionization) is next and has not started. |
 | Repo root | **`/home/sonam/streamhouse` inside WSL2 (Ubuntu 26.04).** This is canonical. The old `E:\streamhouse-project\streamhouse\` copy is stale - do not work in it. |
-| Git | Initialised. Remote `origin` → `https://github.com/SonamKumari1227/StreamHouse.git`, branch `master`. Last commit `c0753c5`. **Everything from item 3 onward is uncommitted** — `docs/decisions/`, `docs/runbook.md`, `infra/docker-compose.yml`, `infra/postgres/`, `Makefile`, `.env.example`, `requirements.txt`, plus edits to `CLAUDE.md`, `README.md`, `docs/README.md`, `docs/architecture.md`. **User handles all staging, commits and pushes manually.** |
+| Git | Remote `origin` → `https://github.com/SonamKumari1227/StreamHouse.git`, branch `master`, in sync with origin at `ff8deaf` as of 2026-10-05. **User handles all staging, commits and pushes manually** (hard rule 3). |
 | IDE | PyCharm — `.idea/` present and already gitignored. |
-| Python 3.11 | Installed at `C:\Users\erson\AppData\Local\Programs\Python\Python311\python.exe`. `py` defaults to 3.13 — always invoke `py -3.11` explicitly. |
-| venv | `.venv` (Python 3.11.9). Deps installed **per phase**, not from `requirements.txt` wholesale — see the Airflow blocker below. |
-| Docker | 27.5.1, Compose v2.32.4. Core stack verified healthy. |
-| GNU Make | 3.81, at `C:\Program Files (x86)\GnuWin32\bin\make.exe`. On the **Windows user PATH** since 2026-09-24, so every newly started process resolves `make` — terminals, PyCharm, PowerShell, Claude Code sessions. Also in `~/.bashrc`. No export prefix needed. |
+| Python 3.11 | `/usr/bin/python3.11` in the Ubuntu distro. The host Windows install is no longer used. Note Ubuntu 26.04's own `python3` is **3.14**, which PySpark does not support — always go through `.venv`. |
+| venv | `.venv` (Python 3.11.16). Deps installed **per phase**, not from `requirements.txt` wholesale — see the Airflow blocker below. **PySpark and Delta are deliberately absent**; see "Where Spark code runs" below. |
+| Docker | 27.5.1, Compose v2.32.4. Core stack verified healthy 2026-10-05, all 7 containers. Docker Desktop WSL2 integration is enabled for Ubuntu, so `docker` works from inside the distro against the same daemon. |
+| GNU Make | 4.4.1 from Ubuntu's apt, on PATH. The GnuWin32 3.81 caveat below applied to the Windows copy and no longer binds — but nothing in the Makefile relies on Make 4.x either. |
 
 ### Phase 0 progress
 
@@ -337,6 +337,71 @@ topics               : _connect_configs, _connect_offsets, _connect_status, _sch
 Reference data is seeded and deterministic (seed 20260924); no transactional rows exist, so
 Debezium's initial snapshot is small and its first CDC events are the generator's own writes.
 
+### Phase 2 progress
+
+- [x] `infra/connect/Dockerfile` — Confluent Avro converters layered onto Debezium, cloud SDKs stripped
+- [x] `infra/connectors/orders-postgres.json` — the connector in version control, not in a shell history
+- [x] `make connector-register` / `connector-status` — idempotent `PUT .../config`
+- [x] `infra/spark/Dockerfile` + `spark-defaults.conf` — Delta 3.2.1, hadoop-aws 3.3.4, spark-sql-kafka, spark-avro
+- [x] `generator/registry.py` — schema registry client and the Confluent wire format
+- [x] `contracts/orders.v1.avsc`, `orders.v2.avsc` — the captured CDC contract and its evolution
+- [x] `ingestion/smoke_test.py` — proves Delta + S3A + Kafka before any streaming job is written
+- [x] `ingestion/bronze_cdc_stream.py` — MERGE on `(source_table, pk, lsn)`, DLQ, tombstones handled
+- [x] `ingestion/bronze_gps_stream.py` — append-only, dedup on `(topic, partition, offset)`
+- [x] `tests/chaos/test_schema_evolution.py` — the registry gate, exercised against the live registry
+- [x] `tests/spark/test_bronze_transforms.py` — 12 tests on the transforms (added 2026-10-05)
+- [x] ADR-0007 (healthchecks), ADR-0008 (CDC topics and schema capture), ADR-0009 (Spark runtime)
+- [x] `docs/runbook.md` §4.7–4.10 — Connect topics, connector operations, load-test results, schema evolution
+
+**Phase 2 is done when:** `UPDATE orders SET status='DELIVERED'` lands in Bronze Delta within
+seconds. Met — §4.9 reconciles 8384 messages to 8383 Bronze rows with 0 duplicates, p50 latency
+19s, and §4.10 proves the registry refuses an incompatible schema.
+
+**VERIFIED 2026-10-05**, actual output:
+
+```
+ruff check           : All checks passed!
+ruff format --check  : 29 files already formatted
+mypy (strict)        : Success: no issues found in 29 source files
+host suite           : 275 passed, 61 deselected in 1.0s
+make test-spark      : 12 passed in 12.2s
+```
+
+### What 2026-10-05 had to repair
+
+Phase 2 was written and committed with its quality gates red — 51 ruff findings, 31 mypy
+errors — and with **no tests at all** on `ingestion/`, the code the phase exists to deliver.
+Both are closed now. Three things are worth keeping in mind so it does not recur:
+
+- **`ingestion/` had no `__init__.py`.** mypy then resolved the same file under two module
+  names (`bronze_cdc_stream` and `ingestion.bronze_cdc_stream`) the moment a test imported it
+  by package path, and refused to check anything. It is a package now, as `generator/` is.
+- **A marker does not stop an import.** `tests/spark/` is deselected on the host by the
+  `spark` marker, but pytest collects before it deselects, and collection imports pyspark,
+  which the host venv has not got. `tests/spark/conftest.py` sets `collect_ignore_glob` so
+  the host run skips the directory outright rather than dying on a collection error.
+- **`make stream-gps` was documented in the job's own docstring but never existed** in the
+  Makefile. Added.
+
+### Where Spark code runs, and where its tests run
+
+**PySpark and Delta are deliberately not installed in `.venv`.** They live in the Spark image
+(ADR-0009), and everything under `ingestion/` runs there via `spark-submit`. Installing a
+host copy would mean a JDK plus a 300 MB wheel pinned to match the image, maintained in
+parallel, testing a runtime that is not the one that ships.
+
+The consequence is a split test suite, and both halves must pass:
+
+| Command | Runs | Where |
+| --- | --- | --- |
+| `make test` | 275 unit tests | host venv, no containers, ~1s |
+| `make test-spark` | 12 transform tests | inside the Spark image, ~13s |
+| `pytest -m integration` | Postgres/Redpanda round trips | host, needs `make up` |
+
+`make test-spark` passes `-p no:cacheprovider` because the repo is bind-mounted into Spark
+**read-only** and the container runs as `spark`, not as the host user — pytest writing
+`.pytest_cache` there fails. Tests in `tests/spark/` are Python 3.8 code, same as the jobs.
+
 ### Chaos and the dedup key (Phase 1)
 
 - **A duplicate is the same WAL record delivered twice, not the same write repeated.**
@@ -431,8 +496,8 @@ Each phase ends in something demoable. Never leave the repo in a broken state.
 | --- | --- | --- |
 | 0 | Foundation — repo skeleton, core Compose profile, Postgres DDL + logical replication, ADR-0001, runbook | **DONE, verified 2026-09-24** |
 | 1 | Source simulation — OLTP generator (Faker + order state machine), GPS producer, `--chaos` flag | **DONE, verified 2026-09-24** |
-| 2 | CDC ingestion + contracts — Debezium connector, Avro schemas registered `BACKWARD`, Bronze streaming, DLQ, exactly-once | **NEXT** |
-| 3 | Silver — SCD2 via Delta `MERGE`, dedup on `(pk, lsn)`, GPS sessionization, GE gate, `OPTIMIZE`/`ZORDER` | Not started |
+| 2 | CDC ingestion + contracts — Debezium connector, Avro schemas registered `BACKWARD`, Bronze streaming, DLQ, exactly-once | **DONE, verified 2026-10-05** |
+| 3 | Silver — SCD2 via Delta `MERGE`, dedup on `(pk, lsn)`, GPS sessionization, GE gate, `OPTIMIZE`/`ZORDER` | **NEXT** |
 | 4 | Gold — dbt star schema, `dim_date` from Nager.Date, Open-Meteo join, generic + singular tests, docs | Not started |
 | 5 | Orchestration — Airflow 3 DAGs, dynamic task mapping, idempotent backfills, SLA callbacks | Not started |
 | 6 | Observability — OpenLineage → Marquez, Grafana SLO dashboard, Prometheus alert rules, runbook | Not started |
@@ -453,10 +518,15 @@ streamhouse/
 ├── docs/
 │   ├── architecture.md    trimmed design spec — the source of truth for design
 │   └── decisions/         ADRs — one per real fork in the road
-├── infra/             docker-compose, connector configs, prometheus/grafana config
+├── infra/
+│   ├── docker-compose.yml  the stack; connect and spark-master are built, not pulled
+│   ├── connect/       Dockerfile — Debezium + Confluent Avro converters
+│   ├── connectors/    connector definitions, registered by `make connector-register`
+│   ├── postgres/      init DDL, applied on first boot and by `make db-init`
+│   └── spark/         Dockerfile + spark-defaults.conf — Delta, S3A, Kafka, test tooling
 ├── contracts/         Avro schemas — the source of truth for shape
-├── generator/         synthetic OLTP + GPS producers, chaos injection
-├── ingestion/         Spark Structured Streaming jobs, API extractors
+├── generator/         synthetic OLTP + GPS producers, chaos injection, registry client
+├── ingestion/         Spark Structured Streaming jobs — Python 3.8, run via spark-submit
 ├── transform/
 │   ├── silver/        PySpark: SCD2 MERGE, dedup, sessionization
 │   └── gold_dbt/      dbt project: staging, marts, tests, macros, seeds
@@ -464,7 +534,8 @@ streamhouse/
 ├── orchestration/     Airflow DAGs
 ├── serving/           FastAPI metrics service, Streamlit dashboard
 └── tests/
-    ├── unit/          pure transform logic, chispa DataFrame assertions
+    ├── unit/          pure logic, host venv, no containers
+    ├── spark/         DataFrame transforms — run in the Spark image via `make test-spark`
     ├── integration/   testcontainers — real Postgres + Kafka
     └── chaos/         one test per chaos scenario
 ```
@@ -474,8 +545,9 @@ streamhouse/
 ## Conventions
 
 **Python**
-- Target **3.11 only**. PySpark 3.5.x supports 3.8–3.11; 3.13 will not work.
-- Create the venv with `py -3.11 -m venv .venv` (Phase 1, not needed yet).
+- Target **3.11** on the host. Anything under `ingestion/` (and from Phase 3, `transform/silver/`)
+  runs in the Spark image on **3.8.10** — no `StrEnum`, no `slots=True`, no `match`. See ADR-0009.
+- Create the venv with `python3.11 -m venv .venv`. Ubuntu's own `python3` is 3.14 and unusable here.
 - Pin every dependency in `requirements.txt`. An unpinned portfolio repo stops building within a year.
 - Type hints on all function signatures. `mypy` must pass.
 
@@ -483,11 +555,17 @@ streamhouse/
 - `ruff check` and `ruff format --check` — both must pass.
 - Line length 100.
 - Run via `pre-commit` locally; enforced in CI from Phase 1.
+- **Run them before committing, not after.** Phase 2 was pushed with 51 ruff and 31 mypy
+  findings and they had to be cleaned up retroactively on 2026-10-05.
 
 **Tests**
 - `pytest`. Unit tests need no containers and must stay fast.
 - DataFrame equality via `chispa`, never manual `collect()` comparison.
 - Integration tests use `testcontainers` (real Postgres + Kafka), never mocks of infrastructure.
+- Spark tests run in the image: `make test-spark`. They are marked `spark` and are skipped on
+  the host, which has no JVM.
+- **A phase is not done until its own code is tested.** Phase 2 shipped `ingestion/` with no
+  tests at all; that gap was only closed afterwards.
 - Target 80% coverage on `transform/` once that code exists.
 
 **SQL and data**

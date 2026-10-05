@@ -17,7 +17,6 @@ Needs the core stack up and the connector registered:  make up && make connector
 
 from __future__ import annotations
 
-import copy
 import json
 import pathlib
 import urllib.error
@@ -56,7 +55,7 @@ def _post(path: str, body: dict[str, Any]) -> tuple[int, Any]:
 def registry() -> str:
     try:
         subjects = _get("/subjects")
-    except Exception as exc:  # noqa: BLE001 - any failure means no registry
+    except Exception as exc:
         pytest.skip(f"schema registry unreachable ({exc}); run `make up`")
     if SUBJECT not in subjects:
         pytest.skip(f"{SUBJECT} is not registered; run `make connector-register`")
