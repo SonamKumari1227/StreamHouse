@@ -21,6 +21,7 @@ PSQL    := $(CORE) exec -T postgres psql -v ON_ERROR_STOP=1 -U $(PG_USER) -d $(P
 .DEFAULT_GOAL := help
 .PHONY: help up down clean ps logs db-init health connect-topics minio-init \
 	connector-register connector-status spark-smoke stream-bronze stream-gps \
+	silver-orders silver-dim silver-dims silver-trips quality-gate silver-maintain \
 	test test-spark build
 
 help:  ## Show available targets
@@ -100,6 +101,18 @@ db-init:  ## Apply the OLTP schema (idempotent; safe to re-run)
 CONNECTOR_FILE := infra/connectors/orders-postgres.json
 CONNECTOR_NAME := streamhouse-postgres
 
+# Docker Desktop publishes container ports to the WINDOWS host. This repo lives inside the
+# WSL2 distro, where `localhost:<published port>` is NOT reachable - the connection is
+# accepted and then hangs until it times out, which is a far more annoying symptom than a
+# refusal. Every admin HTTP call therefore runs from a container on the compose network and
+# addresses services by their compose name. That works from WSL2, from Windows, and on any
+# machine regardless of which ports happen to be published.
+#
+# `connect` carries the curl because the Debezium image ships one (its own healthcheck uses
+# it). If connect is itself down these report UNREACHABLE for everything; the container
+# listing that `make health` prints first is what tells you why.
+INNET := $(CORE) exec -T connect curl -sf --max-time 10
+
 # Credentials live in .env, never in the committed JSON. The rendered config is piped
 # straight into curl and the response captured in a shell variable, so the password is never
 # written to disk. PUT /connectors/<name>/config creates the connector when absent and
@@ -109,9 +122,9 @@ connector-register:  ## Register or update the Debezium connector (idempotent)
 	@set -a; . ./.env; set +a; \
 	resp=$$(envsubst < $(CONNECTOR_FILE) \
 		| python3 -c "import json,sys; print(json.dumps(json.load(sys.stdin)['config']))" \
-		| curl -s -w '\n%{http_code}' -X PUT \
+		| $(CORE) exec -T connect curl -s -w '\n%{http_code}' -X PUT \
 			-H 'Content-Type: application/json' --data @- \
-			localhost:$${SH_CONNECT_PORT:-8083}/connectors/$(CONNECTOR_NAME)/config); \
+			http://localhost:8083/connectors/$(CONNECTOR_NAME)/config); \
 	code=$$(printf '%s' "$$resp" | tail -n1); \
 	if [ "$$code" = "200" ] || [ "$$code" = "201" ]; then \
 		echo "  $(CONNECTOR_NAME): registered/updated (HTTP $$code)"; \
@@ -120,7 +133,7 @@ connector-register:  ## Register or update the Debezium connector (idempotent)
 	fi
 
 connector-status:  ## Show the connector and its task state
-	@curl -sf localhost:8083/connectors/$(CONNECTOR_NAME)/status \
+	@$(INNET) http://localhost:8083/connectors/$(CONNECTOR_NAME)/status \
 		| python3 -m json.tool 2>/dev/null \
 		|| echo "  $(CONNECTOR_NAME) is not registered (run: make connector-register)"
 
@@ -167,6 +180,56 @@ stream-gps:  ## Stream GPS pings into Bronze Delta. Use: make stream-gps ONCE=1
 		/opt/streamhouse/ingestion/bronze_gps_stream.py \
 		$(if $(ONCE),--once,)
 
+# ---------------------------------------------------------------- silver
+
+silver-orders:  ## Build Silver fact_order_state from Bronze. Use: make silver-orders ONCE=1
+	@$(CORE) exec -T spark-master /opt/spark/bin/spark-submit \
+		--master spark://spark-master:7077 \
+		--conf spark.cores.max=$(STREAM_CORES) \
+		/opt/streamhouse/transform/silver/fact_order_state.py \
+		$(if $(ONCE),--once,)
+
+DIM ?= restaurants
+
+silver-dim:  ## Build an SCD2 dimension. Use: make silver-dim DIM=menu_items ONCE=1
+	@$(CORE) exec -T spark-master /opt/spark/bin/spark-submit \
+		--master spark://spark-master:7077 \
+		--conf spark.cores.max=$(STREAM_CORES) \
+		/opt/streamhouse/transform/silver/dim_scd2.py \
+		--dim $(DIM) $(if $(ONCE),--once,)
+
+silver-trips:  ## Sessionize Bronze GPS pings into trips. Use: make silver-trips ONCE=1
+	@$(CORE) exec -T spark-master /opt/spark/bin/spark-submit \
+		--master spark://spark-master:7077 \
+		--conf spark.cores.max=$(STREAM_CORES) \
+		/opt/streamhouse/transform/silver/gps_trips_sessionized.py \
+		$(if $(ONCE),--once,)
+
+QUALITY_TABLE ?= fact_order_state
+
+# PYTHONPATH is set because spark-submit puts the SCRIPT's directory on sys.path, not the
+# repo root - so `from quality.expectations import ...` fails with ModuleNotFoundError. The
+# Silver jobs do not hit this: they import nothing but pyspark. executorEnv is belt and
+# braces; the suites build Column expressions in the driver and never run on an executor.
+quality-gate:  ## Gate a Silver table. Use: make quality-gate QUALITY_TABLE=gps_trips_sessionized
+	@$(CORE) exec -T -e PYTHONPATH=/opt/streamhouse spark-master /opt/spark/bin/spark-submit \
+		--master spark://spark-master:7077 \
+		--conf spark.cores.max=$(STREAM_CORES) \
+		--conf spark.executorEnv.PYTHONPATH=/opt/streamhouse \
+		/opt/streamhouse/quality/run_gate.py --table $(QUALITY_TABLE)
+
+silver-maintain:  ## OPTIMIZE + ZORDER + VACUUM the Silver tables. DRY_RUN=1 to report only
+	@$(CORE) exec -T spark-master /opt/spark/bin/spark-submit \
+		--master spark://spark-master:7077 \
+		--conf spark.cores.max=$(STREAM_CORES) \
+		/opt/streamhouse/transform/silver/maintain.py \
+		$(if $(DRY_RUN),--dry-run,)
+
+silver-dims:  ## Build all three SCD2 dimensions, once each
+	@$(MAKE) --no-print-directory silver-dim DIM=restaurants ONCE=1
+	@$(MAKE) --no-print-directory silver-dim DIM=riders ONCE=1
+	@$(MAKE) --no-print-directory silver-dim DIM=menu_items ONCE=1
+
 spark-smoke:  ## Prove Delta + S3A + Kafka work before writing a streaming job
 	@$(CORE) exec -T spark-master /opt/spark/bin/spark-submit \
 		--master spark://spark-master:7077 \
@@ -212,22 +275,22 @@ health:  ## Verify every core service
 	@echo ""
 	@echo "=== redpanda ==="
 	@$(CORE) exec -T redpanda rpk cluster health
-	@printf "schema registry  : "; curl -sf localhost:8081/subjects && echo "" || echo "UNREACHABLE"
+	@printf "schema registry  : "; $(INNET) http://redpanda:8081/subjects && echo "" || echo "UNREACHABLE"
 	@echo ""
 	@echo "=== kafka connect ==="
-	@printf "connectors       : "; curl -sf localhost:8083/connectors \
-		&& echo "  <- empty is correct until Phase 2" || echo "UNREACHABLE"
-	@printf "pg plugin        : "; curl -sf localhost:8083/connector-plugins \
+	@printf "connectors       : "; $(INNET) http://localhost:8083/connectors \
+		&& echo "" || echo "UNREACHABLE"
+	@printf "pg plugin        : "; $(INNET) http://localhost:8083/connector-plugins \
 		| grep -o PostgresConnector | head -1 || echo "NOT FOUND"
 	@echo ""
 	@echo "=== minio ==="
-	@curl -sf localhost:9000/minio/health/live >/dev/null \
+	@$(INNET) http://minio:9000/minio/health/live >/dev/null \
 		&& echo "live             : OK" || echo "live             : UNREACHABLE"
 	@echo ""
 	@echo "=== spark ==="
-	@curl -sf localhost:8090 >/dev/null \
+	@$(INNET) http://spark-master:8080 >/dev/null \
 		&& echo "master UI        : OK" || echo "master UI        : UNREACHABLE"
-	@printf "workers alive    : "; curl -sf localhost:8090/json/ \
+	@printf "workers alive    : "; $(INNET) http://spark-master:8080/json/ \
 		| grep -o '"aliveworkers" : [0-9]*' | grep -o '[0-9]*$$' || echo "?"
 	@echo ""
 	@echo "UIs: console http://localhost:8080 | minio http://localhost:9001 | spark http://localhost:8090"

@@ -41,7 +41,7 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
-from ingestion.bronze_cdc_stream import to_bronze_rows
+from ingestion.bronze_cdc_stream import classify_batch, to_bronze_rows
 from ingestion.bronze_gps_stream import to_bronze_pings
 
 pytestmark = pytest.mark.spark
@@ -204,8 +204,79 @@ def test_same_lsn_on_different_rows_is_not_a_duplicate(spark: SparkSession) -> N
     assert deduped.count() == 2
 
 
+# ------------------------------------------------------------------ CDC: what reaches Bronze
+
+
+def nothing_decoded(offset: int = 0, value: bytes | None = None) -> tuple[Any, ...]:
+    """A row whose envelope decoded to nothing.
+
+    PERMISSIVE `from_avro` returns a struct whose every field is null - NOT a null struct -
+    so this is what both a tombstone and a genuinely corrupt payload look like downstream.
+    """
+    return ("cdc.public.orders", 0, offset, KAFKA_TS, value, (None, None, None, None, None))
+
+
+def test_tombstone_never_reaches_bronze(spark: SparkSession) -> None:
+    """The regression that put two rows of nulls into raw_orders_cdc.
+
+    A tombstone is Debezium's null-valued record after a delete. It carries no payload, and
+    the preceding op='d' event already holds the full before image, so Bronze wants nothing
+    to do with it. The old filter tested `envelope IS NULL`, which is false here, and the row
+    landed as a row of nulls that no MERGE could ever deduplicate.
+    """
+    df = spark.createDataFrame([nothing_decoded(offset=1, value=None)], DECODED)
+    tombstones, undecodable, decodable = classify_batch(df)
+    assert tombstones.count() == 1
+    assert decodable.count() == 0
+    assert undecodable.count() == 0, "a tombstone is routine traffic, not a contract violation"
+
+
+def test_corrupt_payload_is_quarantined_not_landed(spark: SparkSession) -> None:
+    """Bytes arrived but decoded to nothing. That is evidence, and it belongs in the DLQ."""
+    df = spark.createDataFrame(
+        [nothing_decoded(offset=2, value=b"\x00\x00\x00\x00\x09junk")], DECODED
+    )
+    tombstones, undecodable, decodable = classify_batch(df)
+    assert undecodable.count() == 1
+    assert decodable.count() == 0
+    assert tombstones.count() == 0
+
+
+def test_a_real_change_is_decodable(spark: SparkSession) -> None:
+    df = spark.createDataFrame([change("c", lsn=1)], DECODED)
+    tombstones, undecodable, decodable = classify_batch(df)
+    assert decodable.count() == 1
+    assert tombstones.count() == 0
+    assert undecodable.count() == 0
+
+
+def test_every_row_lands_in_exactly_one_class(spark: SparkSession) -> None:
+    """Disjoint and total.
+
+    This is the property the original code lacked: its three filters left a gap, and rows
+    that fell into it were silently written to Bronze instead of being quarantined.
+    """
+    rows = [
+        change("c", lsn=1, offset=1),
+        change("u", lsn=2, offset=2),
+        nothing_decoded(offset=3, value=None),
+        nothing_decoded(offset=4, value=b"\x00\x00\x00\x00\x09junk"),
+    ]
+    df = spark.createDataFrame(rows, DECODED)
+    tombstones, undecodable, decodable = classify_batch(df)
+    assert tombstones.count() + undecodable.count() + decodable.count() == df.count()
+
+
 # --------------------------------------------------------------------------- GPS
 
+# event_ts is a TIMESTAMP, not a long.
+#
+# This schema said LongType until 2026-10-06, and the test passed while the job was broken:
+# `from_avro` honours the contract's `logicalType: timestamp-millis` and hands back a decoded
+# timestamp, so the job's `event_ts / 1000` could never have worked. A fixture invented from
+# the .avsc's physical type rather than from what Spark actually produces will happily certify
+# a job that cannot run - which is what happened here. Mirror the decoded schema, not the wire
+# format.
 PING = StructType(
     [
         StructField("rider_id", LongType()),
@@ -215,7 +286,7 @@ PING = StructType(
         StructField("speed_kmph", DoubleType()),
         StructField("heading_deg", DoubleType()),
         StructField("accuracy_m", DoubleType()),
-        StructField("event_ts", LongType()),
+        StructField("event_ts", TimestampType()),
     ]
 )
 
@@ -230,18 +301,18 @@ DECODED_PING = StructType(
     ]
 )
 
-# Device clock: 2026-09-28 06:30:00 UTC. Deliberately on a different date from arrival.
-EVENT_TS_MS = 1790577000000
+# Device clock. Deliberately on a different date from arrival, so the two cannot be confused.
+EMITTED = datetime(2026, 9, 28, 6, 30, 0)
 ARRIVED_LATE = datetime(2026, 9, 29, 9, 0, 0)
 
 
 def ping(
     offset: int = 0,
-    event_ts_ms: int = EVENT_TS_MS,
+    emitted: datetime = EMITTED,
     arrived: datetime = ARRIVED_LATE,
     body: bool = True,
 ) -> tuple[Any, ...]:
-    payload = (7, "trip-1", 12.97, 77.59, 24.5, 90.0, 5.0, event_ts_ms) if body else None
+    payload = (7, "trip-1", 12.97, 77.59, 24.5, 90.0, 5.0, emitted) if body else None
     return ("gps.pings", 0, offset, arrived, b"\x00\x00\x00\x00\x02payload", payload)
 
 
@@ -254,7 +325,7 @@ def test_event_ts_is_the_device_clock_not_arrival(spark: SparkSession) -> None:
     """
     df = spark.createDataFrame([ping()], DECODED_PING)
     row = to_bronze_pings(df).collect()[0]
-    assert row["event_ts"] == datetime.utcfromtimestamp(EVENT_TS_MS / 1000)
+    assert row["event_ts"] == EMITTED
     assert row["kafka_ts"] == ARRIVED_LATE
     assert row["event_ts"] != row["kafka_ts"]
 

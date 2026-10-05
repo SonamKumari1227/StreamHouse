@@ -27,7 +27,12 @@ Phases 0–2 are complete. This section is the honest inventory; update it as it
 | Bronze CDC stream — Kafka → Delta, idempotent, with a DLQ | ✅ Phase 2 — §4.9 |
 | Bronze GPS stream — append-only, deduped on Kafka coordinates | ✅ Phase 2 |
 | Schema evolution gate | ✅ Phase 2 — §4.10 |
-| Silver (SCD2, sessionization), Gold, Airflow, observability | ⬜ Phase 3 onward, not started |
+| Silver `fact_order_state` — latest state per order, idempotent | ✅ Phase 3, `make silver-orders` |
+| Silver SCD2 dimensions — restaurant, rider, menu item | ✅ Phase 3, `make silver-dims` |
+| Silver `gps_trips_sessionized` — watermarked on event time | ✅ Phase 3, `make silver-trips` |
+| Quality gate, quarantining failures (not Great Expectations — ADR-0010) | ✅ Phase 3, `make quality-gate` |
+| `OPTIMIZE`/`ZORDER` + a stated 168h `VACUUM` policy | ✅ Phase 3, `make silver-maintain` |
+| Gold, Airflow, observability | ⬜ Phase 4 onward, not started |
 
 Verified 2026-10-05: `ruff`, `mypy --strict`, 275 host tests and 12 Spark transform tests all
 green — `make test` and `make test-spark`.

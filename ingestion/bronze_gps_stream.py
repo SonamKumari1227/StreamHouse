@@ -65,13 +65,19 @@ def to_bronze_pings(decoded: DataFrame) -> DataFrame:
         F.col("ping.heading_deg").alias("heading_deg"),
         F.col("ping.accuracy_m").alias("accuracy_m"),
         # Device time. Phase 3 watermarks on this; it is never the arrival time.
-        (F.col("ping.event_ts") / 1000).cast("timestamp").alias("event_ts"),
+        #
+        # NOT divided by 1000. The contract declares event_ts as
+        # {"type": "long", "logicalType": "timestamp-millis"}, and from_avro honours the
+        # logical type - so this arrives already decoded as a TIMESTAMP. Dividing it was this
+        # job's first contact with real data and it failed outright:
+        #   [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] ... ("TIMESTAMP" and "INT")
+        F.col("ping.event_ts").alias("event_ts"),
         F.col("topic"),
         F.col("partition"),
         F.col("offset"),
         F.col("timestamp").alias("kafka_ts"),
         F.current_timestamp().alias("ingest_ts"),
-        F.to_date((F.col("ping.event_ts") / 1000).cast("timestamp")).alias("event_date"),
+        F.to_date(F.col("ping.event_ts")).alias("event_date"),
     )
 
 

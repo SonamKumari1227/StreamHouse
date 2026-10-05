@@ -130,6 +130,31 @@ def to_bronze_rows(decoded: DataFrame, table: str) -> DataFrame:
     )
 
 
+def classify_batch(batch_df: DataFrame) -> tuple[DataFrame, DataFrame, DataFrame]:
+    """Split one micro-batch into (tombstones, undecodable, decodable).
+
+    The three are disjoint and together cover the batch, which is the point: every row has
+    exactly one destination, and none can fall between the filters.
+
+    **The test is `envelope.op`, not `envelope`.** `from_avro` in PERMISSIVE mode returns a
+    struct whose fields are all null when it cannot decode a payload - not a null struct. So
+    `envelope IS NULL` is false for a row that decoded to nothing, and the row sails past the
+    quarantine filter into Bronze as a row of nulls. Two of them reached `raw_orders_cdc`
+    before this was caught, and they were unkillable: the MERGE predicate `t.pk = s.pk` never
+    matches when pk is null, so every replay inserted them again.
+
+    `op` is the right probe because the Debezium envelope declares it as a required string,
+    so a non-null `op` means the payload genuinely decoded.
+    """
+    is_tombstone = F.col("value").isNull()
+    decoded = F.col("envelope.op").isNotNull()
+    return (
+        batch_df.filter(is_tombstone),
+        batch_df.filter(~is_tombstone & ~decoded),
+        batch_df.filter(~is_tombstone & decoded),
+    )
+
+
 def write_batch(batch_df: DataFrame, batch_id: int, table: str, spark: SparkSession) -> None:
     """Idempotent write of one micro-batch, plus the quarantine split.
 
@@ -140,13 +165,13 @@ def write_batch(batch_df: DataFrame, batch_id: int, table: str, spark: SparkSess
 
     batch_df.persist()
     try:
-        # A null Kafka value is a tombstone, not a failure. Separate it out before
-        # anything is judged undecodable.
-        tombstones = batch_df.filter(F.col("value").isNull()).count()
+        # A null Kafka value is a tombstone, not a failure, and not Bronze's business either.
+        tombstone_df, bad, good_df = classify_batch(batch_df)
+
+        tombstones = tombstone_df.count()
         if tombstones:
             print(f"batch {batch_id}: skipped {tombstones} tombstone(s)")
 
-        bad = batch_df.filter(F.col("value").isNotNull() & F.col("envelope").isNull())
         bad_count = bad.count()
         if bad_count:
             (
@@ -159,7 +184,7 @@ def write_batch(batch_df: DataFrame, batch_id: int, table: str, spark: SparkSess
             )
             print(f"batch {batch_id}: quarantined {bad_count} undecodable row(s)")
 
-        good = to_bronze_rows(batch_df.filter(F.col("envelope").isNotNull()), table)
+        good = to_bronze_rows(good_df, table)
 
         # Two changes to the same row inside one batch would make the MERGE ambiguous, so
         # collapse to the latest LSN per key first. Same rule Phase 3's SCD2 needs.

@@ -80,7 +80,7 @@ Show each file or group of files after creating it, then wait before continuing.
 
 | | |
 | --- | --- |
-| **Active phase** | **Phase 2 — COMPLETE and verified 2026-10-05.** Phase 3 (Silver: SCD2, dedup, sessionization) is next and has not started. |
+| **Active phase** | **Phase 3 — COMPLETE and verified 2026-10-06.** Phase 4 (Gold: dbt star schema) is next and has not started. Phases 0–2 completed earlier. |
 | Repo root | **`/home/sonam/streamhouse` inside WSL2 (Ubuntu 26.04).** This is canonical. The old `E:\streamhouse-project\streamhouse\` copy is stale - do not work in it. |
 | Git | Remote `origin` → `https://github.com/SonamKumari1227/StreamHouse.git`, branch `master`, in sync with origin at `ff8deaf` as of 2026-10-05. **User handles all staging, commits and pushes manually** (hard rule 3). |
 | IDE | PyCharm — `.idea/` present and already gitignored. |
@@ -402,6 +402,165 @@ The consequence is a split test suite, and both halves must pass:
 **read-only** and the container runs as `spark`, not as the host user — pytest writing
 `.pytest_cache` there fails. Tests in `tests/spark/` are Python 3.8 code, same as the jobs.
 
+### Phase 3 progress
+
+- [x] `transform/silver/fact_order_state.py` — one row per order, latest state
+- [x] `tests/spark/test_fact_order_state.py` — 13 tests, incl. the MERGE replay guard
+- [x] `transform/silver/dim_scd2.py` — all three dimensions, one parameterised module
+- [x] `tests/spark/test_dim_scd2.py` — 15 tests, incl. the non-overlapping-windows bar
+- [x] `transform/silver/gps_trips_sessionized.py` — watermarked on event time
+- [x] `tests/spark/test_gps_trips.py` — 11 tests
+- [x] `quality/expectations.py` + `quality/run_gate.py` — the Bronze → Silver gate
+- [x] `tests/spark/test_expectations.py` — 16 tests
+- [x] `transform/silver/maintain.py` — `OPTIMIZE`/`ZORDER` + a stated `VACUUM` policy
+- [x] ADR-0010 — why the gate is not Great Expectations
+- [x] `make silver-orders`, `silver-dim DIM=`, `silver-dims`, `silver-trips`,
+      `quality-gate QUALITY_TABLE=`, `silver-maintain` (all take `ONCE=1` where it applies)
+
+**VERIFIED 2026-10-05/06** against the real tables, not fixtures.
+
+`fact_order_state`:
+
+```
+bronze change rows                        : 8387
+bronze distinct orders                    : 2134
+silver rows / distinct keys               : 2134 / 2134   <- no duplicate keys
+silver deleted (is_deleted)               : 1
+orders whose silver LSN != bronze max LSN : 0             <- ranking provably right
+status: DELIVERED 706 | PICKED_UP 648 | ACCEPTED 513 | CANCELLED 158 | PLACED 109 = 2134
+types: placed_ts timestamp (microseconds), total_inr decimal(10,2)
+```
+
+The SCD2 dimensions, against **the correctness bar in `transform/silver/README.md`**:
+
+```
+                        rows   keys   versions per key
+dim_restaurant_scd2      118     80   1->50, 2->22, 3->8    (50 + 44 + 24 = 118)
+dim_rider_scd2           161    120   1->90, 2->19, 3->11   (90 + 38 + 33 = 161)
+dim_menu_item_scd2       625    570   1->530, 2->25, 3->15  (530 + 50 + 45 = 625)
+
+keys with more than one open window      : 0   (all three)
+overlapping validity windows             : 0   (all three)
+closed windows handing over to nothing   : 0   (all three)
+```
+
+Price history, read straight out of `dim_menu_item_scd2` - contiguous windows, one open end:
+
+```
+menu_item_id price_inr valid_from                 valid_to                   is_current
+1            103.59    2026-10-05 16:18:55.884795 2026-10-05 17:18:55.933130 false
+1            113.95    2026-10-05 17:18:55.933130 2026-10-05 18:18:55.947238 false
+1            108.25    2026-10-05 18:18:55.947238 NULL                       true
+```
+
+`gps_trips_sessionized`: 167 trips covering all 12000 pings - 120 riders each mid-trip at
+start, plus the 47 rollovers the producer reported.
+
+The quality gate, over every Silver table:
+
+```
+fact_order_state       2134 rows, 2132 passed,    2 quarantined (rider_assigned_once_picked_up)
+dim_restaurant_scd2     118 rows,  118 passed,    0 quarantined
+dim_rider_scd2          161 rows,  161 passed,    0 quarantined
+dim_menu_item_scd2      625 rows,  625 passed,    0 quarantined
+gps_trips_sessionized   167 rows,  167 passed,    0 quarantined
+```
+
+**The two quarantined rows are real and were hand-made.** Orders 15765 and 16428 were given
+`status='DELIVERED'` by direct SQL during earlier CDC testing, bypassing the generator's state
+machine, so they are DELIVERED with no rider. The gate caught exactly the rows that did not go
+through the front door. Nothing to fix in the pipeline; left quarantined as evidence.
+
+Maintenance, first run:
+
+```
+fact_order_state      200 -> 1 file(s), zordered by order_id
+dim_restaurant_scd2    61 -> 1          zordered by restaurant_id
+dim_rider_scd2         86 -> 1          zordered by rider_id
+dim_menu_item_scd2    188 -> 1          zordered by menu_item_id
+gps_trips_sessionized 112 -> 1          zordered by trip_id       all vacuumed at 168h
+```
+
+#### What the CDC payload actually looks like
+
+Established by reading the registered schema and a real Bronze row. Do not re-derive these
+from first principles; they are not what you would guess:
+
+- **Timestamps are ISO-8601 strings, not epoch millis.** A `timestamptz` column under
+  `time.precision.mode=connect` becomes `io.debezium.time.ZonedTimestamp`, which is a string
+  like `2026-09-28T17:11:53.125601Z`. They are **cast**, never divided by 1000. The GPS
+  contract is the opposite - a bare long of millis - so the two jobs differ on purpose.
+- **Money carries `logicalType: decimal`** with scale 2, precision 10, so `from_avro` yields a
+  real `DecimalType(10,2)` and Bronze's `after_json` holds `2001.06`, a JSON number. Had the
+  logical type been absent, Spark would have decoded raw bytes and `to_json` would have
+  written **base64** into Bronze - worth checking before trusting any new decimal column.
+- **`to_json` omits null fields entirely.** A PLACED order's `after_json` has no `rider_id`
+  key at all, not `"rider_id": null`. Parsing must tolerate absence, which `from_json` does.
+- **`after` is a bare Avro reference** to the record defined under `before` (named `Value`),
+  so a tool walking the schema has to resolve it by name or it finds nothing.
+
+#### Kafka retention ate the dimension history (2026-10-06)
+
+The dimension CDC was gone before Silver was built. `cdc.public.restaurants` reported a high
+watermark of 86 but `LOG-START-OFFSET == HIGH-WATERMARK` on every partition: `retention.ms` is
+**604800000 (7 days)**, and the Phase 2 snapshot plus the Phase 1 mutations were older than
+that. The Bronze stream read the topic and correctly landed nothing.
+
+**CDC that is not landed in Bronze inside the retention window is gone.** Not degraded -
+gone, because the WAL slot has long since advanced past it. This is the concrete argument for
+Phase 6's freshness alerting: a stream that stops is not an inconvenience, it is a deadline.
+
+The history was rebuilt by applying deliberate, ordered changes in Postgres (`round 0`
+re-emits every row as a synthetic re-snapshot, rounds 1 and 2 change shrinking subsets), which
+makes better SCD2 material than the original random mutations: keys end up with one, two and
+three versions, which is what exercises both the chaining and the close-the-open-row path.
+
+#### `from_avro` honours logical types, and a fixture that lied (2026-10-06)
+
+`bronze_gps_stream.py` had never run against real data - `gps.pings` was deleted before Phase
+2 ended - and its first contact failed outright:
+
+```
+[DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve "(ping.event_ts / 1000)"
+... incompatible types ("TIMESTAMP" and "INT")
+```
+
+The contract declares `event_ts` as `{"type": "long", "logicalType": "timestamp-millis"}`, and
+`from_avro` **honours the logical type**, so it arrives already decoded as a TIMESTAMP. The
+`/ 1000` could never have worked.
+
+The part worth remembering is why the tests did not catch it: the fixture schema declared
+`event_ts` as `LongType`, invented from the `.avsc`'s *physical* type. A test built on a
+guessed schema certifies the guess, not the code. **Mirror what Spark actually produces, not
+the wire format** - and the cheapest way to know is to decode one real row and print the
+schema, which is what `/tmp/peek_bronze.py` existed for.
+
+Note the CDC jobs are the mirror image: Debezium's `timestamptz` arrives as an ISO-8601
+*string* because `ZonedTimestamp` has no Avro logical type. The two conventions differ on
+purpose and neither is guessable.
+
+#### `spark-submit` puts the script's directory on sys.path, not the repo root
+
+`quality/run_gate.py` died with `ModuleNotFoundError: No module named 'quality'`. The Silver
+jobs never hit it because they import nothing but pyspark. Anything that imports across
+packages needs `PYTHONPATH=/opt/streamhouse` on the exec, which `make quality-gate` sets.
+
+#### The tombstone that reached Bronze (found and fixed 2026-10-05)
+
+Two rows in `raw_orders_cdc` had every column null - `pk`, `lsn`, `op`, all three payloads.
+
+**`from_avro` in PERMISSIVE mode returns a struct whose fields are all null, not a null
+struct.** The quarantine filter tested `envelope IS NULL`, which is false for such a row, so
+it passed straight into Bronze. They were also unkillable: the MERGE predicate `t.pk = s.pk`
+never matches when pk is null, so every replay inserted them again.
+
+`classify_batch` now splits a batch into tombstones, undecodable and decodable, probing
+`envelope.op` - a required field in the Debezium envelope, so a non-null `op` means the
+payload genuinely decoded. The three sets are disjoint and total; a test asserts exactly that,
+because the original bug was a *gap between filters*, not a wrong filter. The two bad rows
+were deleted from Bronze (Delta keeps the prior version if that ever needs reversing), leaving
+8387 rows and 8387 distinct `(pk, lsn)`.
+
 ### Chaos and the dedup key (Phase 1)
 
 - **A duplicate is the same WAL record delivered twice, not the same write repeated.**
@@ -486,6 +645,55 @@ repo is ever relocated again, clone it - do not copy it.
 Windows-side `core.autocrlf=true` also means its working tree holds CRLF while the committed
 blobs are LF; a byte copy therefore looks modified on Linux for that reason too.
 
+### Published Docker ports are NOT reachable from inside WSL2
+
+Docker Desktop forwards published ports to the **Windows** host only. From inside the Ubuntu
+distro - which is where this repo lives and where every `make` runs - `localhost:8081`,
+`:8083`, `:9000` and `:8090` are all unreachable. Verified 2026-10-05 against a fully healthy
+daemon, after first mistaking it for a symptom of the outage below:
+
+```
+from Windows : 8081 -> 200    8083 -> 404
+from WSL2    : 8081 -> 000    8083 -> 000     (could not connect)
+```
+
+Every admin HTTP call in the Makefile therefore runs **from a container on the compose
+network**, addressing services by compose name — the `INNET` variable, which carries curl in
+the `connect` container because the Debezium image ships one. `make health`,
+`connector-register` and `connector-status` all work from WSL2 this way, and the targets no
+longer depend on which ports happen to be published.
+
+The browser UIs are a different matter: you open those from Windows, where the published
+ports do work. The URLs `make health` prints are correct for a browser and wrong for curl
+inside the distro.
+
+The Spark jobs were never affected - they run inside the network already and address
+`redpanda:8081` and `minio:9000` directly.
+
+### When Docker stops responding: look at host memory first
+
+On 2026-10-05 the daemon wedged mid-session. `docker ps` hung from **both** Windows and WSL2,
+and connections were accepted and then never answered - a far more confusing symptom than a
+refusal, and it masqueraded as a networking fault for a while.
+
+Cause was host memory. Windows had **1.1 GB free of 15.6 GB** (Chrome 3.4 GB across 40
+processes, PyCharm 1.4 GB), so it trimmed the WSL VM's working set to 1.19 GB while the stack
+needs about 6. `.wslconfig` allots the VM `memory=10GB, processors=4`, but that is a ceiling,
+not a reservation - Windows reclaims under pressure regardless.
+
+Recovery is to restart Docker Desktop; containers carry `restart: unless-stopped` and all
+state is in named volumes, so nothing is lost:
+
+```powershell
+Get-Process "Docker Desktop","com.docker.backend" | Stop-Process -Force
+Start-Process "C:\Program Files\Docker\Docker\Docker Desktop.exe"
+```
+
+Then wait for it rather than polling blind: `until docker ps >/dev/null 2>&1; do sleep 5; done`.
+
+**Close the browser before a long Spark run.** The stack alone is ~6 GB and a `spark-submit`
+driver adds several hundred MB more.
+
 ---
 
 ## Phase plan
@@ -497,7 +705,7 @@ Each phase ends in something demoable. Never leave the repo in a broken state.
 | 0 | Foundation — repo skeleton, core Compose profile, Postgres DDL + logical replication, ADR-0001, runbook | **DONE, verified 2026-09-24** |
 | 1 | Source simulation — OLTP generator (Faker + order state machine), GPS producer, `--chaos` flag | **DONE, verified 2026-09-24** |
 | 2 | CDC ingestion + contracts — Debezium connector, Avro schemas registered `BACKWARD`, Bronze streaming, DLQ, exactly-once | **DONE, verified 2026-10-05** |
-| 3 | Silver — SCD2 via Delta `MERGE`, dedup on `(pk, lsn)`, GPS sessionization, GE gate, `OPTIMIZE`/`ZORDER` | **NEXT** |
+| 3 | Silver — SCD2 via Delta `MERGE`, dedup on `(pk, lsn)`, GPS sessionization, quality gate, `OPTIMIZE`/`ZORDER` | **DONE, verified 2026-10-06** |
 | 4 | Gold — dbt star schema, `dim_date` from Nager.Date, Open-Meteo join, generic + singular tests, docs | Not started |
 | 5 | Orchestration — Airflow 3 DAGs, dynamic task mapping, idempotent backfills, SLA callbacks | Not started |
 | 6 | Observability — OpenLineage → Marquez, Grafana SLO dashboard, Prometheus alert rules, runbook | Not started |
