@@ -1,0 +1,139 @@
+version: 2
+
+models:
+  - name: dim_date
+    description: "**Grain:** one row per calendar day."
+    columns:
+      - name: date_sk
+        description: "Surrogate key. Deterministic hash of the day, so a rebuild is stable."
+        data_tests: [not_null, unique]
+      - name: date_day
+        data_tests: [not_null, unique]
+      - name: day_type
+        description: "WEEKDAY | WEEKEND | HOLIDAY. What the SLA aggregates group by."
+        data_tests:
+          - accepted_values:
+              values: ["WEEKDAY", "WEEKEND", "HOLIDAY"]
+
+  - name: dim_customer
+    description: "**Grain:** one row per customer. Type 1 — no history kept."
+    columns:
+      - name: customer_sk
+        data_tests: [not_null, unique]
+      - name: customer_id
+        data_tests: [not_null, unique]
+      - name: tier
+        data_tests:
+          - accepted_values:
+              values: ["STANDARD", "PLUS", "PRO"]
+
+  - name: dim_restaurant
+    description: "**Grain:** one row per (restaurant, validity window). SCD2."
+    columns:
+      - name: restaurant_sk
+        description: "Hash of (restaurant_id, valid_from): one key per version, not per restaurant."
+        data_tests: [not_null, unique]
+      - name: restaurant_id
+        data_tests: [not_null]
+      - name: commission_pct
+        description: "The rate in force during this window. Facts join to the version, never to current."
+        data_tests: [not_null]
+
+  - name: dim_rider
+    description: "**Grain:** one row per (rider, validity window). SCD2."
+    columns:
+      - name: rider_sk
+        data_tests: [not_null, unique]
+      - name: rider_id
+        data_tests: [not_null]
+      - name: vehicle_type
+        data_tests:
+          - accepted_values:
+              values: ["BIKE", "SCOOTER", "BICYCLE", "CAR"]
+      - name: tier
+        data_tests:
+          - accepted_values:
+              values: ["BRONZE", "SILVER", "GOLD"]
+
+  - name: dim_menu_item
+    description: "**Grain:** one row per (menu item, validity window). SCD2 — carries price history."
+    columns:
+      - name: menu_item_sk
+        data_tests: [not_null, unique]
+      - name: menu_item_id
+        data_tests: [not_null]
+      - name: menu_price_inr
+        description: "Menu price during this window. fact_order_item reads it as of order time."
+        data_tests: [not_null]
+
+  - name: dim_weather
+    description: >
+      **Grain:** one row per (city, day). From Open-Meteo. Empty if the API was unreachable,
+      in which case every fact's weather_sk is null and the weather cuts return nothing.
+    columns:
+      - name: weather_sk
+        data_tests: [not_null, unique]
+      - name: weather_band
+        data_tests:
+          - accepted_values:
+              values: ["CLEAR", "RAIN", "HEAVY_RAIN", "UNKNOWN"]
+
+  - name: fact_delivery
+    description: >
+      **Grain:** one row per order. Delivery measures are null until the order reaches a
+      terminal state; aggregates that care filter on is_delivered.
+    columns:
+      - name: order_sk
+        data_tests: [not_null, unique]
+      - name: order_id
+        data_tests: [not_null, unique]
+      - name: restaurant_sk
+        description: "The restaurant version in force at placed_ts, not the current one."
+        data_tests:
+          - relationships:
+              to: ref('dim_restaurant')
+              field: restaurant_sk
+      - name: customer_sk
+        data_tests:
+          - relationships:
+              to: ref('dim_customer')
+              field: customer_sk
+      - name: date_sk
+        data_tests:
+          - relationships:
+              to: ref('dim_date')
+              field: date_sk
+      - name: status
+        data_tests:
+          - not_null
+          - accepted_values:
+              values: ["PLACED", "ACCEPTED", "PICKED_UP", "DELIVERED", "CANCELLED"]
+      - name: gross_revenue_inr
+        data_tests: [not_null]
+
+  - name: fact_order_item
+    description: "**Grain:** one row per (order, menu item)."
+    columns:
+      - name: order_item_sk
+        data_tests: [not_null, unique]
+      - name: order_sk
+        description: "Joins to fact_delivery. Deliberately not unique — an order has many lines."
+        data_tests:
+          - relationships:
+              to: ref('fact_delivery')
+              field: order_sk
+      - name: qty
+        data_tests: [not_null]
+      - name: unit_price_inr
+        data_tests: [not_null]
+
+  - name: agg_sla_daily
+    description: "**Grain:** one row per (date, city, restaurant). Delivered orders only."
+    columns:
+      - name: order_date
+        data_tests: [not_null]
+      - name: delivered_orders
+        data_tests: [not_null]
+      - name: sla_breach_pct
+        description: "Breached ÷ delivered, as a percentage. Denominator excludes in-flight orders."
+        data_tests: [not_null]

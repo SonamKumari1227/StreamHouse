@@ -69,9 +69,14 @@ def fact_order_state_suite() -> tuple[Expectation, ...]:
             "delivered_after_placed",
             F.col("delivered_ts").isNull() | (F.col("delivered_ts") >= F.col("placed_ts")),
         ),
+        # Deleted orders are exempt. Silver keeps a tombstoned order's last known state as
+        # history, and that state is whatever the source happened to hold when the row was
+        # removed - there is nothing left to repair it against. Holding history to the same
+        # standard as live data would mean a single deleted order blocking every pipeline run
+        # for good, which is a worse failure than the one the rule guards against.
         Expectation(
             "rider_assigned_once_picked_up",
-            ~terminal_with_rider | F.col("rider_id").isNotNull(),
+            F.col("is_deleted") | ~terminal_with_rider | F.col("rider_id").isNotNull(),
         ),
     )
 

@@ -60,7 +60,49 @@ RUN pip install --no-cache-dir --no-deps delta-spark==3.2.1
 # convention - instead of hand-rolled collect() comparisons.
 RUN pip install --no-cache-dir pytest==8.3.5 chispa==0.9.4
 
+# dbt builds Gold (Phase 4). It runs here rather than on the host for the same reason the
+# Spark jobs do: this is where Spark, Delta and the S3A client actually are.
+#
+# dbt-spark's `session` method creates a SparkSession in-process - no Thrift server, no extra
+# container. It calls enableHiveSupport(), so it needs a metastore that survives between
+# invocations: `dbt run` and `dbt test` are separate processes, and an in-memory catalog would
+# forget every table in between.
+RUN pip install --no-cache-dir "dbt-core==1.8.7" "dbt-spark[session]==1.8.0"
+
 RUN mkdir -p /opt/spark/conf
 COPY spark-defaults.conf /opt/spark/conf/spark-defaults.conf
+
+# A SECOND conf directory, used only by dbt via SPARK_CONF_DIR.
+#
+# The metastore is deliberately not in the default conf: switching the whole image to a Hive
+# catalog would make every streaming job open a metastore connection at startup, for tables
+# none of them reference - a new way for an ingestion job to fail, bought for nothing.
+#
+# Derby rather than Postgres, because Derby needs no credentials. A committed conf file with a
+# password in it would breach CLAUDE.md's rule on secrets, and generating the file at runtime
+# is more moving parts than this is worth. Derby is single-writer, which is fine: dbt is the
+# only thing that uses it, one invocation at a time.
+# Both of these are mount points for named volumes, and a fresh named volume inherits the
+# ownership and mode of the image directory it covers. They must be writable by `spark` here,
+# or the volume is created root-owned and dbt dies without printing anything at all - it
+# cannot even open its log file to say why.
+RUN mkdir -p /opt/dbt-conf /opt/metastore /opt/dbt-target \
+    && chmod 777 /opt/metastore /opt/dbt-target
+COPY spark-defaults.conf /opt/dbt-conf/spark-defaults.conf
+RUN { \
+      echo ""; \
+      echo "# ---------------------------------------------------------------- dbt only"; \
+      echo "spark.sql.catalogImplementation hive"; \
+      echo "spark.sql.warehouse.dir s3a://gold/warehouse"; \
+      echo "spark.hadoop.javax.jdo.option.ConnectionURL jdbc:derby:;databaseName=/opt/metastore/metastore_db;create=true"; \
+      echo "spark.hadoop.javax.jdo.option.ConnectionDriverName org.apache.derby.jdbc.EmbeddedDriver"; \
+      echo "spark.hadoop.hive.metastore.schema.verification false"; \
+      echo "spark.hadoop.datanucleus.schema.autoCreateAll true"; \
+      echo ""; \
+      echo "# INSERT OVERWRITE must replace only the partitions the query produced, not the"; \
+      echo "# whole table. Static mode would make a one-day backfill delete every other day,"; \
+      echo "# which is the opposite of what agg_sla_daily's incremental strategy intends."; \
+      echo "spark.sql.sources.partitionOverwriteMode dynamic"; \
+    } >> /opt/dbt-conf/spark-defaults.conf
 
 USER spark

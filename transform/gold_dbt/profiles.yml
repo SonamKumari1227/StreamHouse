@@ -1,0 +1,20 @@
+# dbt runs inside the Spark image, against a SparkSession it creates in-process.
+#
+# `session` rather than `thrift`: no Thrift server to run, no extra container, and the session
+# picks up SPARK_CONF_DIR=/opt/dbt-conf - which is where the Hive metastore and warehouse
+# settings live. See infra/spark/Dockerfile for why that conf is separate from the default.
+#
+# No credentials here. S3A reads AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY from the container
+# environment, which compose populates from .env, and the Derby metastore needs none.
+
+streamhouse:
+  target: local
+  outputs:
+    local:
+      type: spark
+      method: session
+      # `schema` is the default database for models that do not override it; the model configs
+      # in dbt_project.yml put marts in `gold` and staging in `gold_staging`.
+      schema: gold
+      host: localhost
+      threads: 1

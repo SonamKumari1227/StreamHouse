@@ -38,3 +38,19 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = ["pyspark.*", "delta.*"]
 ignore_missing_imports = true
+
+# Airflow is the same story: the DAGs under orchestration/ run inside the Airflow image and
+# the host venv has no airflow, deliberately. `make airflow-dags` is what proves they import -
+# against the real scheduler, which is the only place it matters.
+[[tool.mypy.overrides]]
+module = ["airflow.*", "pendulum.*"]
+ignore_missing_imports = true
+
+# The DAG modules themselves. `@dag` and `@task` are Any here - airflow is not installed - so
+# strict mode reads every decorated function as "untyped decorator makes this untyped", which
+# is true and useless: it is an artefact of the missing stubs, not of the code. The real
+# verification that these modules are sound is `make airflow-dags`, which imports them in the
+# scheduler and reports any import error.
+[[tool.mypy.overrides]]
+module = ["streamhouse_common", "streaming_health", "silver_to_gold", "api_extracts", "backfill"]
+disallow_untyped_decorators = false

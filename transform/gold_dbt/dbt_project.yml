@@ -1,0 +1,48 @@
+name: streamhouse_gold
+version: "1.0.0"
+config-version: 2
+
+profile: streamhouse
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+
+# The repo is mounted read-only into the Spark image, so dbt's scratch space lives on a
+# volume instead. Without this every invocation fails trying to create ./target.
+target-path: "/opt/dbt-target/target"
+log-path: "/opt/dbt-target/logs"
+packages-install-path: "/opt/dbt-target/dbt_packages"
+
+clean-targets: ["/opt/dbt-target/target", "/opt/dbt-target/dbt_packages"]
+
+# Register the Silver and Bronze Delta tables in the metastore before anything runs. They are
+# path-based tables that no catalog knows about otherwise, and dbt's `source()` needs a name.
+# Idempotent, so it costs nothing on a re-run.
+on-run-start:
+  - "{{ register_external_sources() }}"
+
+models:
+  streamhouse_gold:
+    +file_format: delta
+    staging:
+      # Views: staging is renaming and typing, and materialising it would double the storage
+      # for no gain. The marts below are tables because they are what gets queried.
+      +materialized: view
+      +schema: gold_staging
+    marts:
+      +materialized: table
+      +schema: gold
+
+seeds:
+  streamhouse_gold:
+    +schema: gold
+    india_holidays:
+      +column_types:
+        holiday_date: date
+
+vars:
+  # Delivery is promised within this window; a breach is measured against promised_ts, which
+  # the generator sets per order rather than assuming a constant.
+  sla_grace_minutes: 0

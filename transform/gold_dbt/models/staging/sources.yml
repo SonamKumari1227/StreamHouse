@@ -1,0 +1,55 @@
+version: 2
+
+sources:
+  - name: silver
+    description: >
+      Conformed, deduplicated, history-preserving tables built by the PySpark jobs in
+      transform/silver/. Registered in the catalog as external Delta tables by the
+      register_external_sources macro; dbt reads them and never writes them.
+    schema: silver
+    tables:
+      - name: fact_order_state
+        description: "One row per order, holding its latest known state. Keyed on order_id."
+        columns:
+          - name: order_id
+            description: "Primary key, from the OLTP source."
+            data_tests: [not_null, unique]
+          - name: lsn
+            description: "Postgres LSN of the change this state came from. The replay guard."
+
+      - name: dim_restaurant_scd2
+        description: "One row per (restaurant, validity window)."
+        columns:
+          - name: restaurant_id
+            data_tests: [not_null]
+
+      - name: dim_rider_scd2
+        description: "One row per (rider, validity window)."
+        columns:
+          - name: rider_id
+            data_tests: [not_null]
+
+      - name: dim_menu_item_scd2
+        description: "One row per (menu item, validity window). Carries price history."
+        columns:
+          - name: menu_item_id
+            data_tests: [not_null]
+
+      - name: gps_trips_sessionized
+        description: "One row per (rider, trip), sessionized on event time."
+
+  - name: bronze
+    description: >
+      Raw CDC change events and the public-API reference extracts. Gold reads two CDC tables
+      directly because Silver does not model them: customers and order_items need no SCD2 and
+      no sessionization, so a staging model doing latest-state-per-key is the whole job.
+    schema: bronze
+    tables:
+      - name: raw_customers_cdc
+        description: "Every change to customers, one row per change."
+      - name: raw_order_items_cdc
+        description: "Every change to order_items, one row per change."
+      - name: ref_holidays
+        description: "Public holidays from Nager.Date. May be empty if the API was unreachable."
+      - name: ref_weather
+        description: "Daily weather per city from Open-Meteo. May be empty if unreachable."

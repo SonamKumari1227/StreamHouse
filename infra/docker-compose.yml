@@ -8,6 +8,49 @@
 
 name: streamhouse
 
+# Shared by every Airflow component. A top-level extension field, NOT a service: anything
+# under `services:` is a service, even if its key starts with x-, and compose would try to
+# build and run it.
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  image: streamhouse/airflow:3.0.1-docker
+  profiles: ["orchestration"]
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${SH_AIRFLOW_DB_USER:-airflow}:${SH_AIRFLOW_DB_PASSWORD:?set SH_AIRFLOW_DB_PASSWORD in .env}@postgres-meta:5432/${SH_AIRFLOW_DB_NAME:-airflow}
+    # Airflow 3 signs internal API calls with this. A fixed value keeps the components
+    # agreeing across restarts; it is a local dev secret like every other one here.
+    AIRFLOW__API_AUTH__JWT_SECRET: ${SH_AIRFLOW_JWT_SECRET:?set SH_AIRFLOW_JWT_SECRET in .env}
+    AIRFLOW__API__BASE_URL: http://localhost:${SH_AIRFLOW_PORT:-8088}
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    # Airflow 3 removed `airflow users create`; user management belongs to the auth manager
+    # now, and the default is SimpleAuthManager. all_admins means the local UI needs no login
+    # at all - correct for a single-user stack on a laptop, and nothing a shared one should do.
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+    # The DAGs shell out to `docker exec`, so they are told the container and paths rather
+    # than hardcoding them in three places.
+    SH_SPARK_CONTAINER: sh-spark-master
+    SH_REPO_IN_SPARK: /opt/streamhouse
+  volumes:
+    # DAGs read-only: Airflow runs them, it does not own them.
+    - ../orchestration/dags:/opt/airflow/dags:ro
+    - airflow-logs:/opt/airflow/logs
+    # The Docker socket is how Airflow starts Spark work. See infra/airflow/Dockerfile and
+    # ADR-0011 for the trade-off this represents.
+    - /var/run/docker.sock:/var/run/docker.sock
+  # The socket is root:<docker gid>, and the airflow user needs that group to use it. The gid
+  # is machine-specific - `stat -c %g /var/run/docker.sock` - so it comes from .env.
+  group_add:
+    - "${SH_DOCKER_GID:-1001}"
+  depends_on:
+    postgres-meta:
+      condition: service_healthy
+  restart: unless-stopped
+
 services:
 
   # ---------------------------------------------------------------- OLTP source
@@ -179,6 +222,11 @@ services:
     volumes:
       # Read-only: Spark runs the code, it does not own it.
       - ../:/opt/streamhouse:ro
+      # dbt's Hive metastore (Derby). It has to outlive the container, or every `dbt test`
+      # would run against a catalog that forgot what `dbt run` created. Only dbt uses it.
+      - metastore-data:/opt/metastore
+      # dbt writes target/ and logs/, and the repo mount above is read-only.
+      - dbt-target:/opt/dbt-target
     command:
       - /opt/spark/bin/spark-class
       - org.apache.spark.deploy.master.Master
@@ -223,7 +271,85 @@ services:
       start_period: 20s
     restart: unless-stopped
 
+  # ---------------------------------------------------------------- orchestration (Phase 5)
+  #
+  # Brought up separately:  make airflow-up
+  #
+  # Airflow's metadata lives in its OWN Postgres instance, not the OLTP one. Debezium is
+  # replicating that database, and pointing Airflow at it would push thousands of task-instance
+  # rows through the CDC pipeline - a scheduler writing into the system it schedules.
+
+  postgres-meta:
+    image: postgres:16
+    container_name: sh-postgres-meta
+    profiles: ["orchestration"]
+    environment:
+      POSTGRES_USER: ${SH_AIRFLOW_DB_USER:-airflow}
+      POSTGRES_PASSWORD: ${SH_AIRFLOW_DB_PASSWORD:?set SH_AIRFLOW_DB_PASSWORD in .env}
+      POSTGRES_DB: ${SH_AIRFLOW_DB_NAME:-airflow}
+    volumes:
+      - postgres-meta-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SH_AIRFLOW_DB_USER:-airflow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # One-shot: create or upgrade the metadata schema, then exit. No user creation - see the
+  # SimpleAuthManager note above.
+  airflow-init:
+    <<: *airflow-common
+    container_name: sh-airflow-init
+    restart: "no"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        echo "metadata database ready"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: sh-airflow-apiserver
+    command: api-server
+    ports:
+      # 8080 is Redpanda Console's; Airflow gets 8088 on the host.
+      - "${SH_AIRFLOW_PORT:-8088}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/api/v2/version >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: sh-airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Airflow 3 parses DAGs in a process of its own, separate from the scheduler.
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: sh-airflow-dag-processor
+    command: dag-processor
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
 volumes:
   postgres-data:
   redpanda-data:
   minio-data:
+  metastore-data:
+  dbt-target:
+  postgres-meta-data:
+  airflow-logs:

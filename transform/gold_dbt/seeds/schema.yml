@@ -1,0 +1,23 @@
+version: 2
+
+seeds:
+  - name: india_holidays
+    description: >
+      Indian gazetted holidays for 2026.
+
+      A seed rather than an API call because **Nager.Date does not cover India** - it is absent
+      from /AvailableCountries and answers 204 No Content for IN. The Nager extract in
+      ingestion/reference_data.py stays in place and works for the countries it does cover;
+      dim_date unions both, so adding a covered country needs no model change.
+
+      Sixteen rows that change once a year are exactly what a seed is for.
+    columns:
+      - name: holiday_date
+        description: "The calendar day. One row per holiday."
+        data_tests: [not_null, unique]
+      - name: holiday_name
+        data_tests: [not_null]
+      - name: country_code
+        data_tests:
+          - accepted_values:
+              values: ["IN"]

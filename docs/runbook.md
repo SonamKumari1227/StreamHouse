@@ -32,7 +32,11 @@ Phases 0–2 are complete. This section is the honest inventory; update it as it
 | Silver `gps_trips_sessionized` — watermarked on event time | ✅ Phase 3, `make silver-trips` |
 | Quality gate, quarantining failures (not Great Expectations — ADR-0010) | ✅ Phase 3, `make quality-gate` |
 | `OPTIMIZE`/`ZORDER` + a stated 168h `VACUUM` policy | ✅ Phase 3, `make silver-maintain` |
-| Gold, Airflow, observability | ⬜ Phase 4 onward, not started |
+| Gold star schema — dbt-spark, 9 marts, 74 checks green | ✅ Phase 4, `make dbt-build` |
+| Holidays (Nager.Date) + weather (Open-Meteo) reference extracts | ✅ Phase 4, `make reference-data` |
+| Airflow 3 orchestration — 4 DAGs, dynamic task mapping | ✅ Phase 5, `make airflow-up` |
+| Idempotent backfill, proven bit-identical | ✅ Phase 5, `make backfill` |
+| Observability — OpenLineage, Grafana, Prometheus alerts | ⬜ Phase 6, not started |
 
 Verified 2026-10-05: `ruff`, `mypy --strict`, 275 host tests and 12 Spark transform tests all
 green — `make test` and `make test-spark`.

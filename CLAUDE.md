@@ -80,7 +80,7 @@ Show each file or group of files after creating it, then wait before continuing.
 
 | | |
 | --- | --- |
-| **Active phase** | **Phase 3 — COMPLETE and verified 2026-10-06.** Phase 4 (Gold: dbt star schema) is next and has not started. Phases 0–2 completed earlier. |
+| **Active phase** | **Phase 5 — COMPLETE and verified 2026-10-06.** Phase 6 (Observability: OpenLineage, Grafana, Prometheus) is next and has not started. Phases 0–4 completed earlier. |
 | Repo root | **`/home/sonam/streamhouse` inside WSL2 (Ubuntu 26.04).** This is canonical. The old `E:\streamhouse-project\streamhouse\` copy is stale - do not work in it. |
 | Git | Remote `origin` → `https://github.com/SonamKumari1227/StreamHouse.git`, branch `master`, in sync with origin at `ff8deaf` as of 2026-10-05. **User handles all staging, commits and pushes manually** (hard rule 3). |
 | IDE | PyCharm — `.idea/` present and already gitignored. |
@@ -561,6 +561,210 @@ because the original bug was a *gap between filters*, not a wrong filter. The tw
 were deleted from Bronze (Delta keeps the prior version if that ever needs reversing), leaving
 8387 rows and 8387 distinct `(pk, lsn)`.
 
+### Phase 4 progress
+
+- [x] `transform/gold_dbt/` — dbt-spark project: 6 staging views, 9 marts, 4 singular tests
+- [x] `ingestion/reference_data.py` — Nager.Date holidays + Open-Meteo weather
+- [x] `transform/gold_dbt/seeds/india_holidays.csv` — because Nager does not cover India
+- [x] `tests/spark/test_reference_data.py` — 8 tests
+- [x] dbt in the Spark image, with its own `SPARK_CONF_DIR` and a Derby metastore on a volume
+- [x] `make reference-data`, `dbt-build`, `dbt-run`, `dbt-test`, `dbt-docs`
+
+**Phase 4 is done when:** `dbt build` is green and docs generate. Met.
+
+**VERIFIED 2026-10-06:**
+
+```
+dbt build : Completed successfully. PASS=74 WARN=0 ERROR=0 SKIP=0 TOTAL=74
+dbt docs  : Catalog written to /opt/dbt-target/target/catalog.json
+
+row counts   dim_date 15 | dim_customer 500 | dim_restaurant 118 | dim_rider 161
+             dim_menu_item 625 | dim_weather 24 | fact_delivery 2133
+             fact_order_item 6380 | agg_sla_daily 80
+
+point-in-time joins actually matched, not merely built:
+  date_sk       2133/2133 (100%)      customer_sk  2133/2133 (100%)
+  restaurant_sk 2133/2133 (100%)      weather_sk   2133/2133 (100%)
+  rider_sk      1898/2133  (89%)  <-  exactly the orders that have a rider: 1898/1898
+  orders appearing more than once: 0   <- no fan-out
+
+dim_date: 15 days, 1 holiday (Gandhi Jayanti, from the seed), WEEKDAY 10 / WEEKEND 4
+weather : CLEAR 15 | RAIN 7 | HEAVY_RAIN 2   <- real Open-Meteo data, 8 cities
+```
+
+`fact_delivery` is 2133, one fewer than `fact_order_state`'s 2134: the deleted order is
+excluded by `where not is_deleted`.
+
+#### How dbt reaches path-based Delta tables
+
+Silver and Bronze have **no catalog** - the streaming jobs write to `s3a://` paths on purpose,
+so they need no metastore. dbt's `source()` needs a named relation, so:
+
+- `register_external_sources` runs `on-run-start` and registers each path as an **external**
+  table. External matters: dbt can never delete data the Spark jobs own.
+- The metastore is **Derby on a named volume**, configured in a dbt-only `SPARK_CONF_DIR`
+  (`/opt/dbt-conf`). Not in the default conf, because switching the whole image to a Hive
+  catalog would make every streaming job open a metastore connection at startup for tables
+  none of them reference - a new way for ingestion to fail, bought for nothing.
+- Derby rather than Postgres because Derby needs no credentials, and a committed conf file
+  with a password would breach the secrets rule.
+
+#### Four things that cost time in Phase 4
+
+- **A root-owned volume makes dbt exit 2 in total silence.** A fresh named volume inherits the
+  mode of the image directory it covers. `/opt/metastore` was created world-writable but
+  `/opt/dbt-target` was not, so dbt could not open its own log file - and therefore could not
+  report that it could not open its own log file. No stdout, no stderr, exit 2.
+- **`SELECT * EXCEPT (col)` is a Databricks extension.** Open-source Spark 3.5 rejects it. The
+  helper column rides along instead and the callers select named columns.
+- **dbt's default schema naming concatenates.** `gold` + custom schema `gold` gave
+  `gold_gold.dim_date`. Overridden in `macros/generate_schema_name.sql`.
+- **ruff's py311 target broke a Python 3.8 module.** `UP006` rewrote module-level
+  `Tuple[date, str, str]` aliases to builtin `tuple[...]`, which is evaluated at import and
+  raises `TypeError: 'type' object is not subscriptable` on 3.8. Annotations are safe because
+  `from __future__ import annotations` keeps them as strings - **a type alias is not an
+  annotation**. Anything under `ingestion/`, `transform/silver/` or `quality/` must therefore
+  avoid runtime-evaluated generics entirely, not merely avoid writing them by hand.
+
+#### Nager.Date does not cover India
+
+It is absent from `/AvailableCountries`, and `/PublicHolidays/2026/IN` answers **204 No
+Content** - not an error, the API saying it has nothing. The integration is real and works for
+countries it does cover (verified: US 2026 returns 200). Indian holidays come from the
+`india_holidays` dbt seed instead, and `dim_date` unions both sources.
+
+#### `price_variance_inr` is non-zero, and that is not a bug
+
+`fact_order_item` compares the price charged on the line against the menu price in force at
+that moment. Some lines differ, because the menu price history from before 2026-10-05 was lost
+to Kafka's 7-day retention: `scd2_effective_from` backdates the earliest *observed* version
+over orders that were charged a different price. Real variance, known cause.
+
+#### Known noise: HiveAlterHandler
+
+`ERROR HiveAlterHandler: Failed to alter table ...` appears during a dbt build. It is Hive
+failing to update table statistics for a Delta table it does not fully understand. The build
+completes, every test passes. Do not chase it.
+
+### Phase 5 progress
+
+- [x] `orchestration` Compose profile — Airflow 3.0.1 on its own `postgres-meta`
+- [x] `infra/airflow/Dockerfile` — Airflow + a pinned static Docker CLI
+- [x] `orchestration/dags/streamhouse_common.py` — the command builders, written once
+- [x] `streaming_health`, `silver_to_gold`, `api_extracts`, `backfill` — 4 DAGs, 0 import errors
+- [x] `quality/freshness_check.py`, `quality/weather_coverage.py`, `quality/backfill_check.py`
+- [x] `agg_sla_daily` made incremental, `insert_overwrite` over `order_date`
+- [x] ADR-0011 — why Airflow drives Spark through the Docker socket
+- [x] `make airflow-up / airflow-dags / airflow-trigger / backfill / freshness / weather-coverage`
+
+**Phase 5 is done when:** deleting a day of Gold and re-running the backfill produces
+bit-identical output. **Met and proven, 2026-10-06** - the `backfill` DAG asserts it rather
+than leaving it to be checked by hand. All six tasks green:
+
+```
+before : CHECKSUM table=agg_sla_daily date=2026-09-28 rows=80 hash=153839121457
+DELETED agg_sla_daily 2026-09-28; rows now: 0        <- the day was genuinely destroyed
+rebuild: OK created sql incremental model gold.agg_sla_daily
+after  : CHECKSUM table=agg_sla_daily date=2026-09-28 rows=80 hash=153839121457
+```
+
+The checksum is over row **content** - each row rendered to JSON, crc32'd, summed so the
+result is independent of row order. "The same number of rows" is a test a wrong rebuild passes
+easily.
+
+All four DAGs were run to completion, not merely parsed:
+
+```
+backfill          success   6/6 tasks   (the bit-identical proof above)
+streaming_health  success   3/3 tasks   FRESHNESS age_hours=12.93 limit=24.00
+api_extracts      success  10/10 tasks  8 mapped city checks, 2 at a time
+silver_to_gold    success  14/14 tasks  5 Silver + 5 gates + reference + dbt build/docs + maintain
+```
+
+#### Airflow 3 is not Airflow 2, in three ways that bite immediately
+
+- **`airflow users create` is gone.** User management belongs to the auth manager now, and the
+  default is SimpleAuthManager. The compose file sets `SIMPLE_AUTH_MANAGER_ALL_ADMINS`, so the
+  local UI needs no login at all. The first init container ran, printed the CLI help, and
+  "succeeded" - a command that does not exist fails in a way that looks like a usage error.
+- **SLAs were removed.** `sla` and the SLA-miss callback are gone; deadline alerts (AIP-86)
+  are not in 3.0.1. Lateness is enforced with `execution_timeout` plus `on_failure_callback`,
+  which fires on overrun but not on a task that never started - so `streaming_health` covers
+  the second case by asking whether data is still arriving.
+- **The DAG processor is a separate component.** Scheduler, api-server and dag-processor each
+  run as their own container.
+
+Also: `airflow dags list-runs` takes the dag id **positionally** in 3.0.1, not via `-d`.
+
+#### Never embed a Spark script inside a DAG
+
+The first `api_extracts` piped an inline Python script to `spark-submit /dev/stdin`. It
+produced no output at all: the task failed in two seconds with empty stdout, empty stderr and
+`no cities found` - which says nothing about why. Every check now calls a real script in the
+repo (`freshness_check.py`, `weather_coverage.py`, `reference_data.py --print-cities`), which
+is testable, runnable by hand, and fails legibly. The DAGs contain no Python beyond glue.
+
+#### How Airflow starts Spark work, and what it costs
+
+`docker exec` against the Spark container, issuing exactly the command the Makefile issues, so
+a red task is a command that can be pasted into a terminal and there is one definition of how
+a job launches. The cost is the Docker socket mounted into the Airflow containers - effectively
+host root. Acceptable for a single-user local stack, and **the first thing to change if this is
+ever deployed anywhere shared**. Argued in full in ADR-0011; Phase 7 must record it as the
+component with no direct cloud equivalent.
+
+The containers join the socket's group via `SH_DOCKER_GID` in `.env` (default 1001); it is
+machine-specific - `stat -c %g /var/run/docker.sock`.
+
+#### The gate blocked the pipeline, correctly - and the fix belonged at the source
+
+`silver_to_gold`'s first full run **failed**, at `quality_gate[fact_order_state]`. That was the
+design working: the two hand-made rows from earlier CDC testing were still quarantined, the
+gate exited 1, and `dbt_build` never ran on data that disagrees with itself.
+
+It did mean the pipeline could never complete, which is a real operational question rather
+than a cosmetic one. Two separate problems hid behind one failure:
+
+- **Order 15765 was deleted**, so there is nothing left to repair it against. Silver keeps a
+  tombstoned order's last known state as history, and holding history to the same standard as
+  live data means one deleted order blocks every run for good - a worse failure than the one
+  the rule guards. `rider_assigned_once_picked_up` now exempts `is_deleted` rows.
+- **Order 16428 was genuinely wrong** and still present, so it was fixed **in Postgres**, not
+  in Silver. Editing Silver would have been overwritten by the next run; fixing the source let
+  the correction travel the whole pipeline, which is also the best end-to-end demonstration it
+  has had:
+
+```
+UPDATE 1 (Postgres)  ->  batch 9: 1 row into Bronze  ->  batch 1: 1 order into Silver
+gate: rows 2134, passed 2134, quarantined 0
+```
+
+`docker exec` **without `-i`** does not attach stdin, so a heredoc piped into `psql` is
+silently a no-op that exits 0. Two repair attempts "succeeded" while changing nothing before
+that was spotted.
+
+#### Mapped tasks must be bounded by the cluster, not by Airflow
+
+`api_extracts` maps one task per city, and the first run expanded to **eight concurrent
+spark-submits**. Each is a JVM driver holding a few hundred MB, so the WSL VM went from
+comfortable to 106 MiB available and the Docker daemon started answering Internal Server
+Error - the same wedge as the Phase 3 outage, this time self-inflicted.
+
+The sharp edge: the cluster has **2 cores and every job pins 1** (`spark.cores.max`), so a
+third concurrent task cannot execute anyway - it queues *inside Spark* while still holding its
+driver's memory. Concurrency past the core count is pure cost. Both DAGs now carry
+`max_active_tasks=2`, and the mapped task `max_active_tis_per_dag=2`.
+
+**When running the whole stack, do not also run `make test-spark`.** Core stack + Airflow +
+mapped Spark drivers + the test suite's own local sessions do not fit in 9.7 GB together.
+
+#### A bind mount creates its host directory as root
+
+`orchestration/dags` did not exist when the Airflow services were first brought up, so Docker
+created it - owned by root, unwritable by the WSL user. With no sudo available, the fix was a
+throwaway container: `docker run --rm -v ~/streamhouse/orchestration:/x alpine chown -R ...`.
+Create a directory before mounting it, or own it afterwards.
+
 ### Chaos and the dedup key (Phase 1)
 
 - **A duplicate is the same WAL record delivered twice, not the same write repeated.**
@@ -706,8 +910,8 @@ Each phase ends in something demoable. Never leave the repo in a broken state.
 | 1 | Source simulation — OLTP generator (Faker + order state machine), GPS producer, `--chaos` flag | **DONE, verified 2026-09-24** |
 | 2 | CDC ingestion + contracts — Debezium connector, Avro schemas registered `BACKWARD`, Bronze streaming, DLQ, exactly-once | **DONE, verified 2026-10-05** |
 | 3 | Silver — SCD2 via Delta `MERGE`, dedup on `(pk, lsn)`, GPS sessionization, quality gate, `OPTIMIZE`/`ZORDER` | **DONE, verified 2026-10-06** |
-| 4 | Gold — dbt star schema, `dim_date` from Nager.Date, Open-Meteo join, generic + singular tests, docs | Not started |
-| 5 | Orchestration — Airflow 3 DAGs, dynamic task mapping, idempotent backfills, SLA callbacks | Not started |
+| 4 | Gold — dbt star schema, `dim_date` from Nager.Date, Open-Meteo join, generic + singular tests, docs | **DONE, verified 2026-10-06** |
+| 5 | Orchestration — Airflow 3 DAGs, dynamic task mapping, idempotent backfills, SLA callbacks | **DONE, verified 2026-10-06** |
 | 6 | Observability — OpenLineage → Marquez, Grafana SLO dashboard, Prometheus alert rules, runbook | Not started |
 | 7 | **Portability & IaC (validate-only, no cloud spend)** — Terraform for the cloud-equivalent mapping as a design exercise (`validate`/`plan` only, never `apply`); prove storage portability locally by swapping MinIO → local filesystem or a second MinIO via config alone; ADR recording the local→cloud mapping | Not started |
 | 8 | Stretch — Iceberg comparison, Dagster port, streaming Gold, contract CI gate, cost model | Not started |

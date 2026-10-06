@@ -22,7 +22,9 @@ PSQL    := $(CORE) exec -T postgres psql -v ON_ERROR_STOP=1 -U $(PG_USER) -d $(P
 .PHONY: help up down clean ps logs db-init health connect-topics minio-init \
 	connector-register connector-status spark-smoke stream-bronze stream-gps \
 	silver-orders silver-dim silver-dims silver-trips quality-gate silver-maintain \
-	test test-spark build
+	reference-data dbt-build dbt-run dbt-test dbt-docs test test-spark build \
+	airflow-up airflow-down airflow-logs airflow-dags airflow-trigger backfill \
+	freshness weather-coverage backfill-checksum
 
 help:  ## Show available targets
 	@echo "StreamHouse - Phase 0"
@@ -205,6 +207,67 @@ silver-trips:  ## Sessionize Bronze GPS pings into trips. Use: make silver-trips
 		/opt/streamhouse/transform/silver/gps_trips_sessionized.py \
 		$(if $(ONCE),--once,)
 
+# ---------------------------------------------------------------- orchestration (Phase 5)
+
+ORCH := $(COMPOSE) --profile orchestration
+
+airflow-up:  ## Start Airflow (separate profile from the core stack)
+	$(ORCH) up -d
+	@echo ""
+	@echo "Airflow UI: http://localhost:$${SH_AIRFLOW_PORT:-8088}  (no login - local dev)"
+
+airflow-down:  ## Stop Airflow. The core stack keeps running.
+	$(ORCH) down
+
+airflow-logs:  ## Tail the scheduler and dag-processor
+	$(ORCH) logs -f --tail=50 airflow-scheduler airflow-dag-processor
+
+airflow-dags:  ## List the DAGs Airflow has parsed, and any import errors
+	@$(ORCH) exec -T airflow-scheduler airflow dags list
+	@echo ""
+	@echo "=== import errors (empty is correct) ==="
+	@$(ORCH) exec -T airflow-scheduler airflow dags list-import-errors
+
+DAG ?= silver_to_gold
+
+airflow-trigger:  ## Trigger a DAG. Use: make airflow-trigger DAG=backfill
+	@$(ORCH) exec -T airflow-scheduler airflow dags trigger $(DAG)
+
+BACKFILL_DATE ?= 2026-09-28
+
+backfill:  ## Prove the backfill is idempotent for one day
+	@$(ORCH) exec -T airflow-scheduler airflow dags trigger backfill \
+		--conf '{"backfill_date": "$(BACKFILL_DATE)"}'
+
+# ---------------------------------------------------------------- gold (dbt)
+
+# dbt runs inside the Spark image. SPARK_CONF_DIR points at the dbt-only conf, which is the
+# only place the Hive metastore is configured - the streaming jobs never touch it.
+# DBT_PROFILES_DIR points at the project, which carries its own profiles.yml.
+DBT := $(CORE) exec -T \
+	-e SPARK_CONF_DIR=/opt/dbt-conf \
+	-e DBT_PROFILES_DIR=/opt/streamhouse/transform/gold_dbt \
+	-w /opt/streamhouse/transform/gold_dbt \
+	spark-master dbt
+
+dbt-build:  ## Build Gold and run every test (dbt build)
+	@$(DBT) build
+
+dbt-run:  ## Build the Gold models only
+	@$(DBT) run
+
+dbt-test:  ## Run the Gold tests only
+	@$(DBT) test
+
+dbt-docs:  ## Generate dbt docs (written to the dbt-target volume)
+	@$(DBT) docs generate
+
+reference-data:  ## Fetch holidays (Nager.Date) and weather (Open-Meteo) into Bronze
+	@$(CORE) exec -T spark-master /opt/spark/bin/spark-submit \
+		--master spark://spark-master:7077 \
+		--conf spark.cores.max=$(STREAM_CORES) \
+		/opt/streamhouse/ingestion/reference_data.py
+
 QUALITY_TABLE ?= fact_order_state
 
 # PYTHONPATH is set because spark-submit puts the SCRIPT's directory on sys.path, not the
@@ -217,6 +280,34 @@ quality-gate:  ## Gate a Silver table. Use: make quality-gate QUALITY_TABLE=gps_
 		--conf spark.cores.max=$(STREAM_CORES) \
 		--conf spark.executorEnv.PYTHONPATH=/opt/streamhouse \
 		/opt/streamhouse/quality/run_gate.py --table $(QUALITY_TABLE)
+
+FRESHNESS_PATH ?= s3a://bronze/raw_orders_cdc
+MAX_AGE_HOURS  ?= 24
+
+freshness:  ## Fail if a Delta table has stopped receiving rows
+	@$(CORE) exec -T spark-master /opt/spark/bin/spark-submit \
+		--master spark://spark-master:7077 \
+		--conf spark.cores.max=$(STREAM_CORES) \
+		/opt/streamhouse/quality/freshness_check.py \
+		--path $(FRESHNESS_PATH) --max-age-hours $(MAX_AGE_HOURS)
+
+CITY ?= Bengaluru
+
+weather-coverage:  ## Fail if a city has no weather in the reference extract
+	@$(CORE) exec -T spark-master /opt/spark/bin/spark-submit \
+		--master spark://spark-master:7077 \
+		--conf spark.cores.max=$(STREAM_CORES) \
+		/opt/streamhouse/quality/weather_coverage.py --city "$(CITY)"
+
+BACKFILL_TABLE ?= agg_sla_daily
+
+backfill-checksum:  ## Checksum one day of a Gold table (content, order-independent)
+	@$(CORE) exec -T -e PYTHONPATH=/opt/streamhouse spark-master /opt/spark/bin/spark-submit \
+		--master spark://spark-master:7077 \
+		--conf spark.cores.max=$(STREAM_CORES) \
+		--conf spark.executorEnv.PYTHONPATH=/opt/streamhouse \
+		/opt/streamhouse/quality/backfill_check.py \
+		--table $(BACKFILL_TABLE) --date $(BACKFILL_DATE) --action checksum
 
 silver-maintain:  ## OPTIMIZE + ZORDER + VACUUM the Silver tables. DRY_RUN=1 to report only
 	@$(CORE) exec -T spark-master /opt/spark/bin/spark-submit \
